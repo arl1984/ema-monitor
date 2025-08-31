@@ -1,0 +1,2 @@
+name: NYSE Monitor
+on: [workflow_dispatch]
