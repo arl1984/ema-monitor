@@ -1,5 +1,6 @@
-requests
-pandas
-numpy
-matplotlib
-pyyaml
+requests>=2.31
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
+python-dateutil>=2.9
+pyyaml>=6.0
