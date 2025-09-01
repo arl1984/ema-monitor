@@ -1,0 +1,63 @@
+# -------- Data / timeframes --------
+feed: "sip"                  # consolidated tape — best for reliable $volume ranking
+timeframe: "5Min"            # short TF for timely detection
+confirm_timeframe: "1Hour"   # much slower TF slope confirm — enforces multi-hour alignment
+
+# -------- Core indicators --------
+ema_fast: 20
+ema_slow: 50
+rsi_period: 14
+adx_period: 14
+adx_min: 25                  # demand very strong trend strength
+
+# -------- Price/volume gates --------
+price_min: 10.0              # filter out cheap/illiquid names entirely
+volume_mult: 1.2             # require 20%+ above 20-bar avg volume at signal
+
+# -------- Universe (narrow + liquid) --------
+universe_exchanges: ["NYSE","NASDAQ"]  # stick to most liquid venues
+universe_limit: 2000
+universe_top_n: 300          # only top 300 by $volume considered before RVOL
+
+# -------- RVOL --------
+rvol_min: 1.6                # much higher — only unusually heavy volume
+rvol_lookback_days: 30
+rvol_use_same_weekday: true  # weekday-normalized
+
+# -------- Signal logic --------
+signal_lookback_hours: 4     # short window — only very recent crosses
+allow_persistent: true       # still allow, but thresholds are higher
+bull_rsi_min: 58             # strong bullish momentum only
+bear_rsi_max: 42             # strong bearish momentum only
+min_score: 2.3               # very high composite threshold
+ranking_min_score: 2.0       # stricter ranking threshold
+max_alerts_per_run: 10       # keep alerts very limited
+dedupe_window_days: 7        # dedupe over a full week
+
+# -------- Regular hours --------
+regular_hours:
+  start: "09:30"
+  end:   "16:00"
+  tz:    "America/New_York"
+
+# -------- Output / Webhook --------
+signals_csv: "data/signals.csv"
+webhook_type: "discord"      # slack | discord | generic
+webhook_url: ""              # set via env
+
+# -------- Health / telemetry --------
+health:
+  enabled: true
+  min_universe: 100                # expect a decent liquid universe even when strict
+  min_symbols_with_bars: 75
+  min_bar_coverage_pct: 80         # require very high coverage
+  warn_on_empty_signals: true
+
+stats_report:
+  enabled: true
+  level: "verbose"                 # show ratelimit + error counts too
+
+# -------- Optional ranking alert --------
+ranking_alert:
+  enabled: true
+  top_n: 5                         # only surface top 5 bull/bear candidates
