@@ -1,0 +1,63 @@
+# -------- Data / timeframes --------
+feed: "sip"                  # prefer SIP for accurate $volume-based ranking (use "iex" if SIP unavailable)
+timeframe: "5Min"            # keep detection timely
+confirm_timeframe: "30Min"   # slower TF slope confirm for stronger trends
+
+# -------- Core indicators --------
+ema_fast: 20
+ema_slow: 50
+rsi_period: 14
+adx_period: 14
+adx_min: 22                  # stricter trend-strength gate
+
+# -------- Price/volume gates --------
+price_min: 5.0               # filter out illiquid/small low-priced names
+volume_mult: 1.0             # require at/above 20-bar avg volume on the signal bar
+
+# -------- Universe (narrower, then filter) --------
+universe_exchanges: ["NYSE","NASDAQ","AMEX"]
+universe_limit: 2500         # a bit smaller initial pull
+universe_top_n: 500          # rank by intraday $ volume, keep fewer before RVOL
+
+# -------- RVOL --------
+rvol_min: 1.4                # higher minimum relative volume
+rvol_lookback_days: 30
+rvol_use_same_weekday: true  # reduce weekday seasonality in RVOL
+
+# -------- Signal logic --------
+signal_lookback_hours: 6     # shorter default lookback if last_run.json missing
+allow_persistent: true       # still allow, but thresholds below are stricter
+bull_rsi_min: 55             # stronger than neutral for bull setups
+bear_rsi_max: 45             # stronger than neutral for bear setups
+min_score: 2.1               # higher composite threshold for alerts
+ranking_min_score: 1.8       # higher bar for ranking lists
+max_alerts_per_run: 15       # keep alerts tight
+dedupe_window_days: 5
+
+# -------- Regular hours --------
+regular_hours:
+  start: "09:30"
+  end:   "16:00"
+  tz:    "America/New_York"
+
+# -------- Output / Webhook --------
+signals_csv: "data/signals.csv"
+webhook_type: "discord"      # slack | discord | generic
+webhook_url: ""              # or set via env
+
+# -------- Health / telemetry --------
+health:
+  enabled: true
+  min_universe: 75                 # expect a decent universe after filters
+  min_symbols_with_bars: 50
+  min_bar_coverage_pct: 70         # require higher coverage on each scan
+  warn_on_empty_signals: true
+
+stats_report:
+  enabled: true
+  level: "compact"                 # set to "verbose" to include ratelimit + error count
+
+# -------- Optional ranking alert (top lists every run) --------
+ranking_alert:
+  enabled: true
+  top_n: 10
