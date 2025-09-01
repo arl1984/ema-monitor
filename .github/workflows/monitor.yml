@@ -33,24 +33,33 @@ jobs:
         run: |
           python -m pip install -r requirements.txt
 
+      # Step-level 'if:' cannot reference secrets.*.
+      # We inject the secret as an env var and self-skip if it's empty.
       - name: Test Discord webhook (optional)
-        if: ${{ secrets.WEBHOOK_URL != '' }}
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        shell: bash
         run: |
-          python - << 'PY'
-          import os, requests
-          url = os.environ['WEBHOOK_URL']
-          r = requests.post(url, json={"content":"✅ Test from GitHub Actions (no trading signal)."})
-          r.raise_for_status()
-          print("Posted test:", r.status_code)
-          PY
+          if [ -n "${WEBHOOK_URL}" ]; then
+            python - << 'PY'
+            import os, requests
+            url = os.environ.get('WEBHOOK_URL', '')
+            try:
+                r = requests.post(url, json={"content":"✅ Test from GitHub Actions (no trading signal)."}, timeout=10)
+                r.raise_for_status()
+                print("Posted test:", r.status_code)
+            except Exception as e:
+                print("Webhook test failed:", e)
+            PY
+          else
+            echo "No WEBHOOK_URL secret set; skipping test."
+          fi
 
       - name: Run monitor
         env:
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_ENV: ${{ vars.ALPACA_ENV }}         # 'paper' or 'live'
+          ALPACA_ENV: ${{ vars.ALPACA_ENV }}       # 'paper' or 'live'
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_TYPE: discord
         run: |
