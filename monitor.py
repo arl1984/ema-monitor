@@ -1,4 +1,4 @@
-import os, sys, json
+import os, sys, json, time, random
 import argparse
 import requests
 import pandas as pd
@@ -29,6 +29,69 @@ HEADERS = {
 
 CENTRAL_TZ = tz.gettz("America/Chicago")
 EASTERN_TZ = tz.gettz("America/New_York")
+
+# ---------- HTTP w/ retries ----------
+def http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 60, max_retries: int = 3) -> requests.Response:
+    """GET with basic retries on 429/5xx, exp backoff + jitter."""
+    attempt = 0
+    last_exc = None
+    while attempt <= max_retries:
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+            # Retry on 429/5xx
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"Retryable status {r.status_code}", response=r)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            attempt += 1
+            if attempt > max_retries:
+                break
+            sleep_s = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            log(f"[retry] {url} attempt={attempt}/{max_retries} sleeping {sleep_s:.2f}s reason={e}")
+            time.sleep(sleep_s)
+    raise last_exc if last_exc else RuntimeError("HTTP GET failed unexpectedly")
+
+# ---------- File lock (best-effort, cross-platform) ----------
+class FileLock:
+    def __init__(self, path: str):
+        self.lock_path = path + ".lock"
+        self.fh = None
+        self._is_windows = os.name == "nt"
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        self.fh = open(self.lock_path, "a+")
+        try:
+            if self._is_windows:
+                import msvcrt
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        except Exception as e:
+            log(f"[lock] non-fatal: {e}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.fh:
+                if self._is_windows:
+                    import msvcrt
+                    try:
+                        msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                else:
+                    import fcntl
+                    try:
+                        fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                self.fh.close()
+        except Exception:
+            pass
 
 # ---------- Helpers ----------
 def utc_now() -> pd.Timestamp:
@@ -79,7 +142,6 @@ def adx_df(df: pd.DataFrame, period=14) -> pd.Series:
     return dx.ewm(alpha=1/period, adjust=False).mean()
 
 def vwap_series(df: pd.DataFrame) -> pd.Series:
-    # Typical price * volume cumulative / cumulative volume
     tp = (df["h"] + df["l"] + df["c"]) / 3.0
     pv = tp * df["v"]
     cum_pv = pv.cumsum()
@@ -97,6 +159,15 @@ def is_rth(ts_utc: pd.Timestamp, start="09:30", end="16:00", tzname="America/New
 def today_et(dt_utc: pd.Timestamp) -> datetime.date:
     return dt_utc.tz_convert(EASTERN_TZ).date()
 
+def session_open_utc(now_utc: pd.Timestamp, start="09:30", tzname="America/New_York") -> pd.Timestamp:
+    et = now_utc.tz_convert(tz.gettz(tzname))
+    sh, sm = map(int, start.split(":"))
+    so = et.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    # if before RTH open, use previous calendar day
+    if et.time() < so.time():
+        so = so - pd.Timedelta(days=1)
+    return pd.Timestamp(so).tz_convert("UTC")
+
 def get_et_midnight_bounds(now_utc: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp]:
     et_dt = now_utc.tz_convert(EASTERN_TZ)
     start_et = et_dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -104,29 +175,26 @@ def get_et_midnight_bounds(now_utc: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Time
     return start_utc, now_utc
 
 # ---------- Alpaca fetch ----------
-def get_nyse_symbols(limit_universe:int) -> List[str]:
-    """Pull active US equities and filter to NYSE via Alpaca /assets."""
+def get_us_equities(limit_universe:int, exchanges: List[str]) -> List[str]:
+    """Pull active US equities across configured exchanges via Alpaca /assets."""
     try:
-        r = requests.get(f"{BASE_BROKER}/assets", headers=HEADERS, timeout=30)
-        if r.status_code in (401,403):
-            raise RuntimeError(
-                f"Alpaca auth failed ({r.status_code}). "
-                f"Check ALPACA_KEY_ID/ALPACA_SECRET_KEY and ALPACA_ENV='{ALPACA_ENV}'."
-            )
-        r.raise_for_status()
+        r = http_get(f"{BASE_BROKER}/assets", headers=HEADERS, timeout=30)
     except Exception as e:
         print("Error calling /v2/assets:", e, file=sys.stderr)
         raise
     assets = r.json()
-    nyse = [a["symbol"] for a in assets
-            if a.get("class")=="us_equity" and a.get("status")=="active" and a.get("exchange")=="NYSE"]
-    out = sorted(set(nyse))
+    exchanges_set = set(exchanges) if exchanges else {"NYSE","NASDAQ","AMEX"}
+    us = [a["symbol"] for a in assets
+          if a.get("class")=="us_equity"
+          and a.get("status")=="active"
+          and a.get("exchange") in exchanges_set]
+    out = sorted(set(us))
     if limit_universe and limit_universe > 0:
         return out[:max(limit_universe, 1)]
     return out
 
 def fetch_bars_chunk(symbols: List[str], start_iso: str, end_iso: str, timeframe: str, feed: str) -> pd.DataFrame:
-    if not symbols: 
+    if not symbols:
         return pd.DataFrame()
     syms = ",".join(symbols)
     params = {
@@ -139,8 +207,7 @@ def fetch_bars_chunk(symbols: List[str], start_iso: str, end_iso: str, timeframe
         "adjustment": "all",
         "sort": "asc"
     }
-    r = requests.get(f"{BASE_DATA}/stocks/bars", headers=HEADERS, params=params, timeout=60)
-    r.raise_for_status()
+    r = http_get(f"{BASE_DATA}/stocks/bars", headers=HEADERS, params=params, timeout=60)
     data = r.json().get("bars", {})
     rows = []
     for sym, bars in data.items():
@@ -157,7 +224,6 @@ def fetch_bars_chunk(symbols: List[str], start_iso: str, end_iso: str, timeframe
     return df
 
 def fetch_daily_bars(symbols: List[str], start_iso: str, end_iso: str, feed: str) -> pd.DataFrame:
-    # timeframe 1Day for RVOL
     return fetch_bars_chunk(symbols, start_iso, end_iso, "1Day", feed)
 
 # ---------- Universe ranking ----------
@@ -183,8 +249,8 @@ def rank_by_today_dollar_vol(symbols: List[str], tf: str, feed: str, now_utc: pd
     ranked = pd.DataFrame(rows).sort_values("dollar_vol_today", ascending=False).head(top_n)
     return ranked
 
-def compute_rvol_for(symbols: List[str], feed: str, now_utc: pd.Timestamp, lookback_days=30) -> Dict[str, float]:
-    # Fetch ~ (lookback_days+1) days of 1D bars; compute today / median(hist)
+def compute_rvol_for(symbols: List[str], feed: str, now_utc: pd.Timestamp, lookback_days=30, use_same_weekday=True) -> Dict[str, float]:
+    """RVOL = today volume / median(past volumes). Optionally same-weekday median to reduce weekday seasonality."""
     end_utc = now_utc
     start_utc = now_utc - timedelta(days=lookback_days+10)
     daily = pd.DataFrame()
@@ -199,14 +265,23 @@ def compute_rvol_for(symbols: List[str], feed: str, now_utc: pd.Timestamp, lookb
     if daily.empty:
         return {s: 1.0 for s in symbols}
     daily["date_et"] = daily["t"].dt.tz_convert(EASTERN_TZ).dt.date
+    daily["weekday"] = pd.to_datetime(daily["date_et"]).weekday
     for sym, g in daily.groupby("symbol"):
         dvol = g.groupby("date_et")["v"].sum().sort_index()
         if len(dvol) < 5:
             rvol_map[sym] = 1.0
             continue
+        today_date = dvol.index[-1]
         today_vol = dvol.iloc[-1]
-        hist = dvol.iloc[-(lookback_days+1):-1] if len(dvol) > (lookback_days+1) else dvol.iloc[:-1]
-        med = float(hist.median()) if len(hist) else np.nan
+        hist = dvol.iloc[:-1]
+        if use_same_weekday:
+            # filter history to same weekday as today; if too few points, fall back to all hist
+            wd = pd.Timestamp(today_date).weekday()
+            hist_idx = [d for d in hist.index if pd.Timestamp(d).weekday() == wd]
+            hist2 = hist.loc[hist_idx] if len(hist_idx) >= max(5, min(lookback_days//4, 10)) else hist
+        else:
+            hist2 = hist
+        med = float(hist2.tail(lookback_days).median()) if len(hist2) else np.nan
         rvol_map[sym] = float(today_vol / med) if med and med > 0 else 1.0
     return rvol_map
 
@@ -232,7 +307,6 @@ def session_vwap(df: pd.DataFrame, now_utc: pd.Timestamp) -> pd.Series:
     if dft.empty:
         return pd.Series(index=df.index, dtype=float)
     vwap = vwap_series(dft)
-    # reindex back to full df, forward-fill so last today's bar has correct vwap
     vw = vwap.reindex(df.index, method="ffill")
     return vw
 
@@ -258,31 +332,37 @@ def fetch_confirm_slope(symbols: List[str], timeframe: str, feed: str, now_utc: 
         g = g.sort_values("t")
         ema_slow = ema(g["c"], ema_len)
         up = slope_positive(ema_slow)
-        down = not up and len(ema_slow) >= 2 and (ema_slow.iloc[-1] < ema_slow.iloc[-2])
+        down = (not up) and len(ema_slow) >= 2 and (ema_slow.iloc[-1] < ema_slow.iloc[-2])
         out[sym] = (up, down)
     return out
 
 def composite_score(row, rvol: float, is_bull: bool, cfg: dict, ema50=None, ema200=None, vwap=None) -> float:
     score = 0.0
+    # ADX gate up front (hard stop if NaN/low)
+    adx_val = float(row.get("adx", np.nan))
+    if not np.isfinite(adx_val) or adx_val < cfg["adx_min"]:
+        return -1.0
+
     # RVOL contribution (cap at +2)
     score += min(max((rvol - 1.0), 0.0), 2.0)
-    # ADX gate / contribution
-    if row.get("adx", np.nan) >= cfg["adx_min"]:
-        score += 1.0
+    # ADX contribution (already gated)
+    score += 1.0
     # Structure: EMA alignment + VWAP side
     if ema50 is not None and ema200 is not None:
         if is_bull and (row["c"] > ema50 > ema200):
             score += 0.5
         if (not is_bull) and (row["c"] < ema50 < ema200):
             score += 0.5
-    if vwap is not None:
+    if vwap is not None and np.isfinite(vwap):
         if is_bull and (row["c"] > vwap):
             score += 0.5
         if (not is_bull) and (row["c"] < vwap):
             score += 0.5
-    # Momentum proxy (normalized): use last close change vs previous, scaled by ATR-ish volatility via rolling TR
-    # Simple, light-weight proxy:
-    score += 0.25 if (row["ema_fast"] - row["ema_slow"]) / max(abs(row["ema_slow"]), 1e-9) > 0.0025 else 0.0
+    # Momentum proxy (normalized)
+    try:
+        score += 0.25 if (row["ema_fast"] - row["ema_slow"]) / max(abs(row["ema_slow"]), 1e-9) > 0.0025 else 0.0
+    except Exception:
+        pass
     return float(score)
 
 def load_last_run_time(now_utc: pd.Timestamp, default_hours: int) -> pd.Timestamp:
@@ -299,7 +379,7 @@ def read_signals_csv(path="data/signals.csv") -> pd.DataFrame:
     try:
         return pd.read_csv(path)
     except Exception:
-        return pd.DataFrame(columns=["ticker","last_price","timestamp","direction","session","id"])
+        return pd.DataFrame(columns=["ticker","last_price","timestamp","direction","session","id","score","rvol","adx"])
 
 def make_signal_id(ticker:str, direction:str, iso_ts:str) -> str:
     return f"{ticker}|{direction}|{iso_ts}"
@@ -320,10 +400,8 @@ def send_webhook(cfg, payload_text: Optional[str]=None, payload_obj: Optional[di
             if payload_text:
                 requests.post(url, json={"content": payload_text}, timeout=10)
             elif payload_obj:
-                # Discord webhooks accept embeds/content—keep it simple
                 requests.post(url, json=payload_obj, timeout=10)
         else:
-            # generic JSON
             obj = payload_obj if payload_obj else {"text": payload_text}
             requests.post(url, json=obj, timeout=10)
     except Exception as e:
@@ -336,6 +414,13 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
     cfg["webhook_url"]  = os.getenv("WEBHOOK_URL",  cfg.get("webhook_url",""))
     cfg["webhook_type"] = os.getenv("WEBHOOK_TYPE", cfg.get("webhook_type","discord"))
 
+    # Sensitivity knobs (with defaults)
+    bull_rsi_min = cfg.get("bull_rsi_min", 52)
+    bear_rsi_max = cfg.get("bear_rsi_max", 48)
+    volume_mult  = cfg.get("volume_mult", 0.8)
+    rvol_same_wd = cfg.get("rvol_use_same_weekday", True)
+    allow_persist = cfg.get("allow_persistent", True)
+
     log(f"[env] ALPACA_ENV={ALPACA_ENV}  feed={cfg['feed']}  timeframe={cfg['timeframe']}  now_utc={now_utc}")
 
     # Universe selection
@@ -343,12 +428,16 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         universe = [t.strip().upper() for t in override_tickers if t.strip()]
         log(f"[smoke] overriding universe: {universe}")
     else:
-        all_nyse = get_nyse_symbols(cfg["universe_limit"]*3)
-        log(f"[universe] active NYSE symbols from Alpaca: {len(all_nyse)} (sample: {all_nyse[:10]})")
-        ranked = rank_by_today_dollar_vol(all_nyse, cfg["timeframe"], cfg["feed"], now_utc, cfg["universe_top_n"])
+        exchanges = cfg.get("universe_exchanges", ["NYSE","NASDAQ","AMEX"])
+        # pull more than we need, then rank by today dollar volume
+        all_us = get_us_equities(cfg["universe_limit"] * 3, exchanges)
+        log(f"[universe] active US symbols from Alpaca: {len(all_us)} (sample: {all_us[:10]})")
+        ranked = rank_by_today_dollar_vol(all_us, cfg["timeframe"], cfg["feed"], now_utc, cfg["universe_top_n"])
         universe = ranked["symbol"].tolist()
         # RVOL filter (compute on top bucket to save quota)
-        rvol_map = compute_rvol_for(universe, cfg["feed"], now_utc, lookback_days=cfg["rvol_lookback_days"])
+        rvol_map = compute_rvol_for(universe, cfg["feed"], now_utc,
+                                    lookback_days=cfg["rvol_lookback_days"],
+                                    use_same_weekday=rvol_same_wd)
         universe = [s for s in universe if rvol_map.get(s,1.0) >= cfg["rvol_min"]]
         log(f"[universe] after RVOL≥{cfg['rvol_min']}: {len(universe)}")
 
@@ -371,7 +460,13 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
     # Enrich per-symbol with indicators and session VWAP
     out_signals = []
     rankings_bull, rankings_bear = [], []
-    last_run_cutoff = load_last_run_time(now_utc, cfg["signal_lookback_hours"])
+
+    # "don't miss it" window: min(last_run, session_open)
+    last_run_cutoff_hours = cfg.get("signal_lookback_hours", 8)
+    last_run_cutoff = load_last_run_time(now_utc, last_run_cutoff_hours)
+    last_session_open = session_open_utc(now_utc, cfg["regular_hours"]["start"], cfg["regular_hours"]["tz"])
+    last_run_cutoff = min(last_run_cutoff, last_session_open)
+
     prev_signals_df = read_signals_csv(cfg.get("signals_csv","data/signals.csv"))
     dedupe_days = cfg.get("dedupe_window_days", 5)
     cutoff_dedupe = now_utc - timedelta(days=dedupe_days)
@@ -388,7 +483,10 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
 
     # Precompute RVOL again for final universe if we didn't have it above (override provided)
     if override_tickers:
-        rvol_map = compute_rvol_for(universe, cfg["feed"], now_utc, lookback_days=cfg["rvol_lookback_days"])
+        rvol_map = compute_rvol_for(universe, cfg["feed"], now_utc,
+                                    lookback_days=cfg["rvol_lookback_days"],
+                                    use_same_weekday=rvol_same_wd)
+
     # Per-symbol loop
     for sym, g in allbars.groupby("symbol"):
         g = enrich_with_indicators(g, cfg)
@@ -403,10 +501,8 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         # Multi-timeframe slope confirm (if configured)
         slope_up, slope_down = confirm_map.get(sym, (True, True))
 
-        # Cross detection within lookback window
+        # Cross detection within lookback window (since session open or last run)
         recent = g[g["t"] >= last_run_cutoff]
-        if recent.empty:
-            continue
 
         # Evaluate each crossing bar
         crosses = recent[(recent["bull_cross"]) | (recent["bear_cross"])]
@@ -415,17 +511,17 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
             # Gates
             if row["c"] <= cfg["price_min"]:
                 continue
-            if row["v"] < cfg["volume_mult"] * row["vol_ma20"]:
+            if row["v"] < volume_mult * row["vol_ma20"]:
                 continue
-            if is_bull and row["rsi"] <= 50:
+            if is_bull and row["rsi"] <= bull_rsi_min:
                 continue
-            if (not is_bull) and row["rsi"] >= 50:
+            if (not is_bull) and row["rsi"] >= bear_rsi_max:
                 continue
-            if row["adx"] < cfg["adx_min"]:
+            if float(row.get("adx", np.nan)) < cfg["adx_min"]:
                 continue
             # Confirm TF slope
             if confirm_tf:
-                if is_bull and not slope_up: 
+                if is_bull and not slope_up:
                     continue
                 if (not is_bull) and not slope_down:
                     continue
@@ -444,10 +540,10 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
                 ema200=row.get("ema200"),
                 vwap=row.get("sess_vwap")
             )
-            if score < cfg.get("min_score", 2.0):
+            if score < cfg.get("min_score", 1.8):
                 continue
 
-            # Dedupe
+            # Dedupe exact signal
             ts_iso_ct = row["t"].tz_convert(CENTRAL_TZ).isoformat()
             sig_id = make_signal_id(sym, "bullish" if is_bull else "bearish", ts_iso_ct)
             if not prev_signals_df.empty and "id" in prev_signals_df.columns:
@@ -473,6 +569,67 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
                 "adx": round(float(row["adx"]), 2)
             })
 
+        # Optional "persistent state" alert (if no new cross bar in lookback)
+        if allow_persist and crosses.empty:
+            last = g.iloc[-1]
+            if last["c"] > cfg["price_min"]:
+                rvol_last = float(rvol_map.get(sym, 1.0))
+                if rvol_last >= cfg["rvol_min"] and float(last.get("adx", np.nan)) >= cfg["adx_min"]:
+                    bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > bull_rsi_min)
+                    bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < bear_rsi_max)
+                    if confirm_tf:
+                        bull_ctx = bull_ctx and slope_up
+                        bear_ctx = bear_ctx and slope_down
+                    if bull_ctx or bear_ctx:
+                        sc = composite_score(last, rvol_last, bull_ctx, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
+                        # use a daily ID to dedupe one "still-valid" ping per day+symbol+side
+                        today_tag = str(today_et(now_utc))
+                        direction = "bullish" if bull_ctx else "bearish"
+                        sig_id = f"{sym}|{direction}|persistent|{today_tag}"
+                        if not prev_signals_df.empty and "id" in prev_signals_df.columns:
+                            if (prev_signals_df["id"] == sig_id).any():
+                                pass
+                            else:
+                                if sc >= cfg.get("min_score", 1.8):
+                                    ts_iso_ct = last["t"].tz_convert(CENTRAL_TZ).isoformat()
+                                    session = "regular" if is_rth(
+                                        last["t"],
+                                        cfg["regular_hours"]["start"],
+                                        cfg["regular_hours"]["end"],
+                                        cfg["regular_hours"]["tz"]
+                                    ) else "extended"
+                                    out_signals.append({
+                                        "ticker": sym,
+                                        "last_price": round(float(last["c"]), 4),
+                                        "timestamp": ts_iso_ct,
+                                        "direction": direction,
+                                        "session": session,
+                                        "id": sig_id,
+                                        "score": round(float(sc), 3),
+                                        "rvol": round(rvol_last, 2),
+                                        "adx": round(float(last.get("adx", np.nan)), 2)
+                                    })
+                        else:
+                            if sc >= cfg.get("min_score", 1.8):
+                                ts_iso_ct = last["t"].tz_convert(CENTRAL_TZ).isoformat()
+                                session = "regular" if is_rth(
+                                    last["t"],
+                                    cfg["regular_hours"]["start"],
+                                    cfg["regular_hours"]["end"],
+                                    cfg["regular_hours"]["tz"]
+                                ) else "extended"
+                                out_signals.append({
+                                    "ticker": sym,
+                                    "last_price": round(float(last["c"]), 4),
+                                    "timestamp": ts_iso_ct,
+                                    "direction": direction,
+                                    "session": session,
+                                    "id": sig_id,
+                                    "score": round(float(sc), 3),
+                                    "rvol": round(rvol_last, 2),
+                                    "adx": round(float(last.get("adx", np.nan)), 2)
+                                })
+
         # Build ranking snapshot at the LAST bar (no cross required)
         last = g.iloc[-1]
         if last["c"] <= cfg["price_min"]:
@@ -481,8 +638,8 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         if rvol_last < cfg["rvol_min"]:
             continue
         # Build score for bull/bear contexts
-        bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > 50)
-        bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < 50)
+        bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > bull_rsi_min)
+        bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < bear_rsi_max)
         # Confirm TF slope
         if confirm_tf:
             bull_ctx = bull_ctx and slope_up
@@ -490,11 +647,11 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
 
         if bull_ctx:
             sc = composite_score(last, rvol_last, True, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
-            if sc >= cfg.get("ranking_min_score", 1.75):
+            if sc >= cfg.get("ranking_min_score", 1.6):
                 rankings_bull.append((sym, float(last["c"]), float(sc), float(rvol_last), float(last.get("adx", np.nan))))
         if bear_ctx:
             sc = composite_score(last, rvol_last, False, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
-            if sc >= cfg.get("ranking_min_score", 1.75):
+            if sc >= cfg.get("ranking_min_score", 1.6):
                 rankings_bear.append((sym, float(last["c"]), float(sc), float(rvol_last), float(last.get("adx", np.nan))))
 
     # Sort rankings
@@ -514,7 +671,6 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         "sample_symbols": universe[:10]
     }
 
-    # Output / side effects
     if dry_run:
         print({
             **meta,
@@ -523,22 +679,22 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         })
         return
 
-    # Send new cross signals
+    # Send new signals & write CSV (with lock)
     if out_signals:
-        # CSV append with header detection + IDs
         os.makedirs(os.path.dirname(cfg.get("signals_csv","data/signals.csv")), exist_ok=True)
         df = pd.DataFrame(out_signals)
         csv_path = cfg.get("signals_csv","data/signals.csv")
-        if os.path.exists(csv_path):
-            df.to_csv(csv_path, mode="a", header=False, index=False)
-        else:
-            df.to_csv(csv_path, index=False)
+        with FileLock(csv_path):
+            if os.path.exists(csv_path):
+                df.to_csv(csv_path, mode="a", header=False, index=False)
+            else:
+                df.to_csv(csv_path, index=False)
 
         # Webhook text
         def fmt(s):
             return f"**{s['ticker']}** {s['direction'].upper()} @ ${s['last_price']} — {s['timestamp']} ({s['session']}) | score {s['score']} | RVOL {s['rvol']} | ADX {s['adx']}"
         text = "\n".join(fmt(s) for s in out_signals)
-        send_webhook(cfg, payload_text=f"📈 NYSE 20/50 EMA crosses (since last run)\n{text}")
+        send_webhook(cfg, payload_text=f"📈 US 20/50 EMA crosses & setups (since last run)\n{text}")
 
     # Ranking snapshot (optional)
     rank_cfg = cfg.get("ranking_alert", {"enabled": False})
@@ -564,7 +720,17 @@ def main():
         sys.exit(1)
 
     cfg = load_cfg()
-    parser = argparse.ArgumentParser(description="NYSE trend monitor")
+    # sensible defaults if missing
+    cfg.setdefault("universe_exchanges", ["NYSE","NASDAQ","AMEX"])
+    cfg.setdefault("bull_rsi_min", 52)
+    cfg.setdefault("bear_rsi_max", 48)
+    cfg.setdefault("volume_mult", 0.8)
+    cfg.setdefault("rvol_use_same_weekday", True)
+    cfg.setdefault("allow_persistent", True)
+    cfg.setdefault("min_score", 1.8)
+    cfg.setdefault("ranking_min_score", 1.6)
+
+    parser = argparse.ArgumentParser(description="US trend monitor (20/50 EMA)")
     parser.add_argument("--tickers", type=str, default="", help="Comma-separated tickers to override universe (smoke test)")
     parser.add_argument("--dry-run", action="store_true", help="Run everything but do not send webhook or write CSV")
     args = parser.parse_args()
