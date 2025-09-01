@@ -34,22 +34,22 @@ jobs:
           python -m pip install -r requirements.txt
 
       # Uses 'shell: python' so we avoid bash heredoc pitfalls.
-      - name: Test Discord webhook (optional)
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        shell: python
-        run: |
-          import os, requests, sys
-          url = os.environ.get("WEBHOOK_URL", "")
-          if not url:
-              print("No WEBHOOK_URL secret set; skipping test.")
-              sys.exit(0)
-          try:
-              r = requests.post(url, json={"content":"✅ Test from GitHub Actions (no trading signal)."}, timeout=10)
-              r.raise_for_status()
-              print("Posted test:", r.status_code)
-          except Exception as e:
-              print("Webhook test failed:", e)
+#      - name: Test Discord webhook (optional)
+#        env:
+#          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+#        shell: python
+#        run: |
+#          import os, requests, sys
+#          url = os.environ.get("WEBHOOK_URL", "")
+#          if not url:
+#              print("No WEBHOOK_URL secret set; skipping test.")
+#              sys.exit(0)
+#          try:
+#              r = requests.post(url, json={"content":"✅ Test from GitHub Actions (no trading signal)."}, timeout=10)
+#              r.raise_for_status()
+#              print("Posted test:", r.status_code)
+#          except Exception as e:
+#              print("Webhook test failed:", e)
 
       - name: Smoke test (manual only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
