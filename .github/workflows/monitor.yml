@@ -22,12 +22,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install deps
+        run: |
           python -m pip install -r requirements.txt
+
       - name: Test Discord webhook (optional)
-        if: ${{ env.WEBHOOK_URL != '' }}
+        if: ${{ secrets.WEBHOOK_URL != '' }}
         env:
-        WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
           python - << 'PY'
           import os, requests
@@ -36,15 +39,17 @@ jobs:
           r.raise_for_status()
           print("Posted test:", r.status_code)
           PY
+
       - name: Run monitor
         env:
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_ENV: ${{ vars.ALPACA_ENV }}   # should resolve to 'paper'
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}   # <-- your Discord webhook secret
-          WEBHOOK_TYPE: discord                     # or: ${{ vars.WEBHOOK_TYPE }}
+          ALPACA_ENV: ${{ vars.ALPACA_ENV }}         # 'paper' or 'live'
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TYPE: discord
         run: |
           python monitor.py
+
       - name: Commit logs/artifacts
         run: |
           git config user.name "github-actions[bot]"
@@ -60,9 +65,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install deps
+        run: |
           python -m pip install -r requirements.txt
+
       - name: Daily summary
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TYPE: discord
         run: python summary.py daily
 
   summary-weekly:
@@ -73,7 +84,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install deps
+        run: |
           python -m pip install -r requirements.txt
+
       - name: Weekly summary
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TYPE: discord
         run: python summary.py weekly
