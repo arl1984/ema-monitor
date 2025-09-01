@@ -51,6 +51,16 @@ jobs:
           except Exception as e:
               print("Webhook test failed:", e)
 
+      - name: Smoke test (manual only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_ENV: ${{ vars.ALPACA_ENV }}
+          VERBOSE: "1"
+        run: |
+          python monitor.py --tickers IBM,KO,XOM --dry-run
+
       - name: Run monitor
         env:
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
