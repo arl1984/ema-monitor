@@ -30,15 +30,34 @@ HEADERS = {
 CENTRAL_TZ = tz.gettz("America/Chicago")
 EASTERN_TZ = tz.gettz("America/New_York")
 
+# ---------- Telemetry (populated per run) ----------
+METRICS = {
+    "http_gets": 0,
+    "pages_fetched": 0,
+    "symbols_requested": 0,
+    "symbols_with_bars": 0,
+    "bars_rows": 0,
+    "universe_size": 0,
+    "run_started_utc": None,
+    "run_finished_utc": None,
+    "rate_limit_remaining": None,
+    "rate_limit_reset": None,
+    "errors": []
+}
+
 # ---------- HTTP w/ retries ----------
-def http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 60, max_retries: int = 3) -> requests.Response:
-    """GET with basic retries on 429/5xx, exp backoff + jitter."""
+def http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None,
+             timeout: int = 60, max_retries: int = 3) -> requests.Response:
+    """GET with retries on 429/5xx, exp backoff + jitter, and telemetry."""
     attempt = 0
     last_exc = None
     while attempt <= max_retries:
         try:
             r = requests.get(url, headers=headers, params=params, timeout=timeout)
-            # Retry on 429/5xx
+            METRICS["http_gets"] += 1
+            # track rate limits when provided
+            METRICS["rate_limit_remaining"] = r.headers.get("X-RateLimit-Remaining", METRICS["rate_limit_remaining"])
+            METRICS["rate_limit_reset"] = r.headers.get("X-RateLimit-Reset", METRICS["rate_limit_reset"])
             if r.status_code in (429, 500, 502, 503, 504):
                 raise requests.HTTPError(f"Retryable status {r.status_code}", response=r)
             r.raise_for_status()
@@ -51,6 +70,7 @@ def http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = 
             sleep_s = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
             log(f"[retry] {url} attempt={attempt}/{max_retries} sleeping {sleep_s:.2f}s reason={e}")
             time.sleep(sleep_s)
+    METRICS["errors"].append(str(last_exc))
     raise last_exc if last_exc else RuntimeError("HTTP GET failed unexpectedly")
 
 # ---------- File lock (best-effort, cross-platform) ----------
@@ -163,7 +183,6 @@ def session_open_utc(now_utc: pd.Timestamp, start="09:30", tzname="America/New_Y
     et = now_utc.tz_convert(tz.gettz(tzname))
     sh, sm = map(int, start.split(":"))
     so = et.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    # if before RTH open, use previous calendar day
     if et.time() < so.time():
         so = so - pd.Timedelta(days=1)
     return pd.Timestamp(so).tz_convert("UTC")
@@ -193,12 +212,36 @@ def get_us_equities(limit_universe:int, exchanges: List[str]) -> List[str]:
         return out[:max(limit_universe, 1)]
     return out
 
+def fetch_all_pages(url, headers, params, timeout=60):
+    all_rows = []
+    page_token = None
+    while True:
+        q = dict(params)
+        if page_token:
+            q["page_token"] = page_token
+        r = http_get(url, headers=headers, params=q, timeout=timeout)
+        j = r.json()
+        data = j.get("bars", {})
+        page_rows = 0
+        for sym, bars in data.items():
+            for b in bars:
+                all_rows.append({
+                    "symbol": sym,
+                    "t": pd.Timestamp(b["t"]),
+                    "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]
+                })
+                page_rows += 1
+        METRICS["pages_fetched"] += 1
+        page_token = j.get("next_page_token")
+        if not page_token:
+            break
+    return all_rows
+
 def fetch_bars_chunk(symbols: List[str], start_iso: str, end_iso: str, timeframe: str, feed: str) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-    syms = ",".join(symbols)
     params = {
-        "symbols": syms,
+        "symbols": ",".join(symbols),
         "timeframe": timeframe,
         "start": start_iso,
         "end": end_iso,
@@ -207,16 +250,7 @@ def fetch_bars_chunk(symbols: List[str], start_iso: str, end_iso: str, timeframe
         "adjustment": "all",
         "sort": "asc"
     }
-    r = http_get(f"{BASE_DATA}/stocks/bars", headers=HEADERS, params=params, timeout=60)
-    data = r.json().get("bars", {})
-    rows = []
-    for sym, bars in data.items():
-        for b in bars:
-            rows.append({
-                "symbol": sym,
-                "t": pd.Timestamp(b["t"]), "o": b["o"], "h": b["h"],
-                "l": b["l"], "c": b["c"], "v": b["v"]
-            })
+    rows = fetch_all_pages(f"{BASE_DATA}/stocks/bars", HEADERS, params, timeout=60)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).sort_values(["symbol","t"]).reset_index(drop=True)
@@ -230,7 +264,6 @@ def fetch_daily_bars(symbols: List[str], start_iso: str, end_iso: str, feed: str
 def rank_by_today_dollar_vol(symbols: List[str], tf: str, feed: str, now_utc: pd.Timestamp, top_n: int) -> pd.DataFrame:
     start_utc, end_utc = get_et_midnight_bounds(now_utc)
     start_iso, end_iso = start_utc.isoformat(), end_utc.isoformat()
-
     rows = []
     chunk = 50
     for i in range(0, len(symbols), chunk):
@@ -275,7 +308,6 @@ def compute_rvol_for(symbols: List[str], feed: str, now_utc: pd.Timestamp, lookb
         today_vol = dvol.iloc[-1]
         hist = dvol.iloc[:-1]
         if use_same_weekday:
-            # filter history to same weekday as today; if too few points, fall back to all hist
             wd = pd.Timestamp(today_date).weekday()
             hist_idx = [d for d in hist.index if pd.Timestamp(d).weekday() == wd]
             hist2 = hist.loc[hist_idx] if len(hist_idx) >= max(5, min(lookback_days//4, 10)) else hist
@@ -293,7 +325,6 @@ def enrich_with_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     df["rsi"] = rsi(df["c"], cfg["rsi_period"])
     df["vol_ma20"] = df["v"].rolling(20, min_periods=1).mean()
     df["adx"] = adx_df(df, period=cfg.get("adx_period",14))
-    # spread sign for crosses
     spread = df["ema_fast"] - df["ema_slow"]
     sign = np.sign(spread)
     df["bull_cross"] = (sign.shift(1) <= 0) & (sign > 0)
@@ -301,7 +332,6 @@ def enrich_with_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return df
 
 def session_vwap(df: pd.DataFrame, now_utc: pd.Timestamp) -> pd.Series:
-    # compute VWAP only for today's ET bars
     today = today_et(now_utc)
     dft = df[df["t"].dt.tz_convert(EASTERN_TZ).dt.date == today]
     if dft.empty:
@@ -315,8 +345,7 @@ def slope_positive(series: pd.Series) -> bool:
     return bool(series.iloc[-1] > series.iloc[-2])
 
 def fetch_confirm_slope(symbols: List[str], timeframe: str, feed: str, now_utc: pd.Timestamp, ema_len: int) -> Dict[str, Tuple[bool,bool]]:
-    # returns {sym: (ema_slow_slope_up, ema_slow_slope_down)}
-    start_utc = now_utc - timedelta(days=10)  # enough bars for slope
+    start_utc = now_utc - timedelta(days=10)
     df = pd.DataFrame()
     chunk = 50
     for i in range(0, len(symbols), chunk):
@@ -327,7 +356,7 @@ def fetch_confirm_slope(symbols: List[str], timeframe: str, feed: str, now_utc: 
             df = pd.concat([df, bars], ignore_index=True)
     out = {}
     if df.empty:
-        return {s: (True, True) for s in symbols}  # neutral if no data
+        return {s: (True, True) for s in symbols}
     for sym, g in df.groupby("symbol"):
         g = g.sort_values("t")
         ema_slow = ema(g["c"], ema_len)
@@ -338,16 +367,11 @@ def fetch_confirm_slope(symbols: List[str], timeframe: str, feed: str, now_utc: 
 
 def composite_score(row, rvol: float, is_bull: bool, cfg: dict, ema50=None, ema200=None, vwap=None) -> float:
     score = 0.0
-    # ADX gate up front (hard stop if NaN/low)
     adx_val = float(row.get("adx", np.nan))
     if not np.isfinite(adx_val) or adx_val < cfg["adx_min"]:
         return -1.0
-
-    # RVOL contribution (cap at +2)
-    score += min(max((rvol - 1.0), 0.0), 2.0)
-    # ADX contribution (already gated)
-    score += 1.0
-    # Structure: EMA alignment + VWAP side
+    score += min(max((rvol - 1.0), 0.0), 2.0)  # RVOL (0..2)
+    score += 1.0                                # ADX passed
     if ema50 is not None and ema200 is not None:
         if is_bull and (row["c"] > ema50 > ema200):
             score += 0.5
@@ -358,7 +382,6 @@ def composite_score(row, rvol: float, is_bull: bool, cfg: dict, ema50=None, ema2
             score += 0.5
         if (not is_bull) and (row["c"] < vwap):
             score += 0.5
-    # Momentum proxy (normalized)
     try:
         score += 0.25 if (row["ema_fast"] - row["ema_slow"]) / max(abs(row["ema_slow"]), 1e-9) > 0.0025 else 0.0
     except Exception:
@@ -407,14 +430,69 @@ def send_webhook(cfg, payload_text: Optional[str]=None, payload_obj: Optional[di
     except Exception as e:
         print("Webhook error:", e, file=sys.stderr)
 
+# ---------- Health / stats helpers ----------
+def send_health_webhook(cfg, text: str, extra: Optional[dict]=None):
+    payload = {"content": text} if cfg.get("webhook_type","discord") == "discord" else {"text": text}
+    if extra:
+        payload.update(extra)
+    try:
+        send_webhook(cfg, payload_text=text)
+    except Exception as e:
+        log(f"[health webhook] failed: {e}")
+
+def summarize_stats_text(level: str, universe_size: int, signals_count: int) -> str:
+    dur = None
+    try:
+        if METRICS["run_started_utc"] and METRICS["run_finished_utc"]:
+            dur = (pd.Timestamp(METRICS["run_finished_utc"]) - pd.Timestamp(METRICS["run_started_utc"])).total_seconds()
+    except Exception:
+        pass
+    coverage_pct = 0.0
+    if universe_size > 0:
+        coverage_pct = 100.0 * (METRICS["symbols_with_bars"] / max(universe_size,1))
+    header = f"🩺 Scan stats — analyzed={METRICS['symbols_with_bars']}/{universe_size} ({coverage_pct:.1f}%) | bars={METRICS['bars_rows']} | pages={METRICS['pages_fetched']} | http={METRICS['http_gets']} | signals={signals_count}"
+    if dur is not None:
+        header += f" | duration={dur:.1f}s"
+    if level == "verbose":
+        header += f"\nrate_limit_remaining={METRICS['rate_limit_remaining']} reset={METRICS['rate_limit_reset']} errors={len(METRICS['errors'])}"
+    return header
+
+def health_check(cfg, universe_size: int, symbols_with_bars: int) -> Tuple[bool, str]:
+    h = cfg.get("health", {}) or {}
+    if not h.get("enabled", True):
+        return True, ""
+    min_uni = h.get("min_universe", 50)
+    min_sym_bars = h.get("min_symbols_with_bars", 30)
+    min_cov = h.get("min_bar_coverage_pct", 60)
+
+    if universe_size < min_uni:
+        return False, f"⚠️ Degraded run: universe too small ({universe_size} < {min_uni})."
+    coverage_pct = 100.0 * (symbols_with_bars / max(universe_size,1))
+    if symbols_with_bars < min_sym_bars or coverage_pct < min_cov:
+        return False, f"⚠️ Degraded run: low bar coverage {symbols_with_bars}/{universe_size} ({coverage_pct:.1f}% < {min_cov}%)."
+    return True, ""
+
 # ---------- Core pipeline ----------
 def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False):
     now_utc = utc_now()
-    # allow env to override secrets
+    # per-run metrics baseline
+    METRICS.update({
+        "http_gets": 0,
+        "pages_fetched": 0,
+        "symbols_requested": 0,
+        "symbols_with_bars": 0,
+        "bars_rows": 0,
+        "universe_size": 0,
+        "run_started_utc": now_utc.isoformat(),
+        "run_finished_utc": None,
+        "errors": []
+    })
+
+    # allow env to override webhook
     cfg["webhook_url"]  = os.getenv("WEBHOOK_URL",  cfg.get("webhook_url",""))
     cfg["webhook_type"] = os.getenv("WEBHOOK_TYPE", cfg.get("webhook_type","discord"))
 
-    # Sensitivity knobs (with defaults)
+    # Sensitivity knobs
     bull_rsi_min = cfg.get("bull_rsi_min", 52)
     bear_rsi_max = cfg.get("bear_rsi_max", 48)
     volume_mult  = cfg.get("volume_mult", 0.8)
@@ -429,17 +507,18 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         log(f"[smoke] overriding universe: {universe}")
     else:
         exchanges = cfg.get("universe_exchanges", ["NYSE","NASDAQ","AMEX"])
-        # pull more than we need, then rank by today dollar volume
         all_us = get_us_equities(cfg["universe_limit"] * 3, exchanges)
         log(f"[universe] active US symbols from Alpaca: {len(all_us)} (sample: {all_us[:10]})")
         ranked = rank_by_today_dollar_vol(all_us, cfg["timeframe"], cfg["feed"], now_utc, cfg["universe_top_n"])
         universe = ranked["symbol"].tolist()
-        # RVOL filter (compute on top bucket to save quota)
         rvol_map = compute_rvol_for(universe, cfg["feed"], now_utc,
                                     lookback_days=cfg["rvol_lookback_days"],
                                     use_same_weekday=rvol_same_wd)
         universe = [s for s in universe if rvol_map.get(s,1.0) >= cfg["rvol_min"]]
         log(f"[universe] after RVOL≥{cfg['rvol_min']}: {len(universe)}")
+
+    METRICS["universe_size"] = len(universe)
+    METRICS["symbols_requested"] = len(universe)
 
     # Fetch working timeframe bars for last 7 days
     start_utc = now_utc - timedelta(days=7)
@@ -452,8 +531,25 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         if not bars.empty:
             allbars = pd.concat([allbars, bars], ignore_index=True)
 
+    if not allbars.empty:
+        METRICS["bars_rows"] = len(allbars)
+        METRICS["symbols_with_bars"] = allbars["symbol"].nunique()
+    else:
+        METRICS["bars_rows"] = 0
+        METRICS["symbols_with_bars"] = 0
+
+    # Early exit if no bars: warn + stats
     if allbars.empty:
         meta = {"run_time_utc": now_utc.isoformat(), "universe_size": len(universe), "signals_count": 0, "sample_symbols": universe[:10]}
+        if cfg.get("health",{}).get("enabled", True):
+            if len(universe) == 0:
+                send_health_webhook(cfg, "🚫 No symbols in universe after filtering. Check feed, RVOL gates, or exchanges.")
+            else:
+                send_health_webhook(cfg, "⚠️ No bars returned for the selected window. Possible holiday/closed market/pagination/window issue.")
+        if cfg.get("stats_report",{}).get("enabled", True):
+            text = summarize_stats_text(cfg.get("stats_report",{}).get("level","compact"), len(universe), 0)
+            send_health_webhook(cfg, text)
+        METRICS["run_finished_utc"] = utc_now().isoformat()
         print(meta)
         return
 
@@ -461,7 +557,6 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
     out_signals = []
     rankings_bull, rankings_bear = [], []
 
-    # "don't miss it" window: min(last_run, session_open)
     last_run_cutoff_hours = cfg.get("signal_lookback_hours", 8)
     last_run_cutoff = load_last_run_time(now_utc, last_run_cutoff_hours)
     last_session_open = session_open_utc(now_utc, cfg["regular_hours"]["start"], cfg["regular_hours"]["tz"])
@@ -490,25 +585,18 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
     # Per-symbol loop
     for sym, g in allbars.groupby("symbol"):
         g = enrich_with_indicators(g, cfg)
-        # EMA 50/200 for structure
         g["ema50"] = ema(g["c"], 50)
         g["ema200"] = ema(g["c"], 200)
-        # Session VWAP
         g["sess_vwap"] = session_vwap(g, now_utc)
         if len(g) < cfg["ema_slow"]+1:
             continue
 
-        # Multi-timeframe slope confirm (if configured)
         slope_up, slope_down = confirm_map.get(sym, (True, True))
 
-        # Cross detection within lookback window (since session open or last run)
         recent = g[g["t"] >= last_run_cutoff]
-
-        # Evaluate each crossing bar
         crosses = recent[(recent["bull_cross"]) | (recent["bear_cross"])]
         for _, row in crosses.iterrows():
             is_bull = bool(row["bull_cross"])
-            # Gates
             if row["c"] <= cfg["price_min"]:
                 continue
             if row["v"] < volume_mult * row["vol_ma20"]:
@@ -519,18 +607,15 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
                 continue
             if float(row.get("adx", np.nan)) < cfg["adx_min"]:
                 continue
-            # Confirm TF slope
             if confirm_tf:
-                if is_bull and not slope_up:
+                if is_bull and not slope_up: 
                     continue
                 if (not is_bull) and not slope_down:
                     continue
-            # RVOL gate
             rvol = float(rvol_map.get(sym, 1.0))
             if rvol < cfg["rvol_min"]:
                 continue
 
-            # Composite score at the cross bar
             score = composite_score(
                 row,
                 rvol=rvol,
@@ -543,7 +628,6 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
             if score < cfg.get("min_score", 1.8):
                 continue
 
-            # Dedupe exact signal
             ts_iso_ct = row["t"].tz_convert(CENTRAL_TZ).isoformat()
             sig_id = make_signal_id(sym, "bullish" if is_bull else "bearish", ts_iso_ct)
             if not prev_signals_df.empty and "id" in prev_signals_df.columns:
@@ -569,8 +653,8 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
                 "adx": round(float(row["adx"]), 2)
             })
 
-        # Optional "persistent state" alert (if no new cross bar in lookback)
-        if allow_persist and crosses.empty:
+        # Optional persistent-state alert
+        if cfg.get("allow_persistent", True) and crosses.empty:
             last = g.iloc[-1]
             if last["c"] > cfg["price_min"]:
                 rvol_last = float(rvol_map.get(sym, 1.0))
@@ -582,69 +666,42 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
                         bear_ctx = bear_ctx and slope_down
                     if bull_ctx or bear_ctx:
                         sc = composite_score(last, rvol_last, bull_ctx, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
-                        # use a daily ID to dedupe one "still-valid" ping per day+symbol+side
-                        today_tag = str(today_et(now_utc))
                         direction = "bullish" if bull_ctx else "bearish"
+                        today_tag = str(today_et(now_utc))
                         sig_id = f"{sym}|{direction}|persistent|{today_tag}"
-                        if not prev_signals_df.empty and "id" in prev_signals_df.columns:
-                            if (prev_signals_df["id"] == sig_id).any():
-                                pass
-                            else:
-                                if sc >= cfg.get("min_score", 1.8):
-                                    ts_iso_ct = last["t"].tz_convert(CENTRAL_TZ).isoformat()
-                                    session = "regular" if is_rth(
-                                        last["t"],
-                                        cfg["regular_hours"]["start"],
-                                        cfg["regular_hours"]["end"],
-                                        cfg["regular_hours"]["tz"]
-                                    ) else "extended"
-                                    out_signals.append({
-                                        "ticker": sym,
-                                        "last_price": round(float(last["c"]), 4),
-                                        "timestamp": ts_iso_ct,
-                                        "direction": direction,
-                                        "session": session,
-                                        "id": sig_id,
-                                        "score": round(float(sc), 3),
-                                        "rvol": round(rvol_last, 2),
-                                        "adx": round(float(last.get("adx", np.nan)), 2)
-                                    })
-                        else:
-                            if sc >= cfg.get("min_score", 1.8):
-                                ts_iso_ct = last["t"].tz_convert(CENTRAL_TZ).isoformat()
-                                session = "regular" if is_rth(
-                                    last["t"],
-                                    cfg["regular_hours"]["start"],
-                                    cfg["regular_hours"]["end"],
-                                    cfg["regular_hours"]["tz"]
-                                ) else "extended"
-                                out_signals.append({
-                                    "ticker": sym,
-                                    "last_price": round(float(last["c"]), 4),
-                                    "timestamp": ts_iso_ct,
-                                    "direction": direction,
-                                    "session": session,
-                                    "id": sig_id,
-                                    "score": round(float(sc), 3),
-                                    "rvol": round(rvol_last, 2),
-                                    "adx": round(float(last.get("adx", np.nan)), 2)
-                                })
+                        already = (not prev_signals_df.empty and "id" in prev_signals_df.columns and (prev_signals_df["id"] == sig_id).any())
+                        if (not already) and sc >= cfg.get("min_score", 1.8):
+                            ts_iso_ct = last["t"].tz_convert(CENTRAL_TZ).isoformat()
+                            session = "regular" if is_rth(
+                                last["t"],
+                                cfg["regular_hours"]["start"],
+                                cfg["regular_hours"]["end"],
+                                cfg["regular_hours"]["tz"]
+                            ) else "extended"
+                            out_signals.append({
+                                "ticker": sym,
+                                "last_price": round(float(last["c"]), 4),
+                                "timestamp": ts_iso_ct,
+                                "direction": direction,
+                                "session": session,
+                                "id": sig_id,
+                                "score": round(float(sc), 3),
+                                "rvol": round(rvol_last, 2),
+                                "adx": round(float(last.get("adx", np.nan)), 2)
+                            })
 
-        # Build ranking snapshot at the LAST bar (no cross required)
+        # Ranking snapshot (no cross required)
         last = g.iloc[-1]
         if last["c"] <= cfg["price_min"]:
             continue
         rvol_last = float(rvol_map.get(sym, 1.0))
         if rvol_last < cfg["rvol_min"]:
             continue
-        # Build score for bull/bear contexts
         bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > bull_rsi_min)
         bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < bear_rsi_max)
-        # Confirm TF slope
         if confirm_tf:
             bull_ctx = bull_ctx and slope_up
             bear_ctx = bear_ctx and slope_down
-
         if bull_ctx:
             sc = composite_score(last, rvol_last, True, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
             if sc >= cfg.get("ranking_min_score", 1.6):
@@ -655,7 +712,7 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
                 rankings_bear.append((sym, float(last["c"]), float(sc), float(rvol_last), float(last.get("adx", np.nan))))
 
     # Sort rankings
-    rankings_bull.sort(key=lambda x: (-x[2], -x[3]))  # score desc, then rvol desc
+    rankings_bull.sort(key=lambda x: (-x[2], -x[3]))
     rankings_bear.sort(key=lambda x: (-x[2], -x[3]))
 
     # Limit outgoing alerts
@@ -671,12 +728,25 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         "sample_symbols": universe[:10]
     }
 
+    # Health + stats reporting (always before sending signals)
+    ok, warn_msg = health_check(cfg, METRICS["universe_size"], METRICS["symbols_with_bars"])
+    if not ok:
+        send_health_webhook(cfg, warn_msg)
+    if cfg.get("stats_report",{}).get("enabled", True):
+        text = summarize_stats_text(cfg.get("stats_report",{}).get("level","compact"),
+                                    METRICS["universe_size"], len(out_signals))
+        send_health_webhook(cfg, text)
+    if len(out_signals) == 0 and cfg.get("health",{}).get("warn_on_empty_signals", True):
+        send_health_webhook(cfg, "ℹ️ No qualifying signals this scan (filters may be tight or just a quiet window).")
+
+    # Output / side effects
     if dry_run:
         print({
             **meta,
             "top_bull": rankings_bull[:10],
             "top_bear": rankings_bear[:10],
         })
+        METRICS["run_finished_utc"] = utc_now().isoformat()
         return
 
     # Send new signals & write CSV (with lock)
@@ -711,6 +781,8 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
     # Save meta / last run
     os.makedirs("data", exist_ok=True)
     save_json("data/last_run.json", meta)
+
+    METRICS["run_finished_utc"] = utc_now().isoformat()
     print(meta)
 
 # ---------- CLI ----------
