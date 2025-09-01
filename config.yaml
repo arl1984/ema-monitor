@@ -1,18 +1,39 @@
-# Filters / settings
-price_min: 5.0
-volume_mult: 1.5         # current bar vol must be >= 1.5 x avg(20)
-rsi_period: 14
+feed: "iex"                  # or "sip" depending on plan
+timeframe: "5Min"            # working TF
+confirm_timeframe: "30Min"   # higher TF slope confirm; "" to disable
+
 ema_fast: 20
 ema_slow: 50
-timeframe: 5Min
-feed: iex                 # free tier on Alpaca ('sip' if you have that plan)
-universe_limit: 100
-# Session (RTH) for labeling only (signal runs extended by default)
+rsi_period: 14
+adx_period: 14
+adx_min: 22                  # trend strength gate
+
+price_min: 5.0
+volume_mult: 1.2             # last bar volume vs 20-bar average
+
+# Universe
+universe_limit: 800          # initial pull (x3 inside script)
+universe_top_n: 300          # rank by today's dollar volume, then filter by RVOL
+rvol_min: 1.5
+rvol_lookback_days: 30
+
+# Signal logic
+signal_lookback_hours: 6     # if last_run.json missing, search last N hours
+min_score: 2.0               # composite threshold for signal alerts
+ranking_min_score: 1.75      # lower bar for ranking lists
+max_alerts_per_run: 25
+dedupe_window_days: 5
+
 regular_hours:
-  tz: America/New_York
   start: "09:30"
   end:   "16:00"
+  tz:    "America/New_York"
 
-# Webhook (optional): Slack/Discord or any JSON POST endpoint
-webhook_url: ""          # e.g., https://hooks.slack.com/services/XXX
-webhook_type: "slack"    # "slack" or "discord" or "generic"
+# Webhook
+webhook_type: "discord"      # slack | discord | generic
+webhook_url: ""
+
+# Optional ranking alert (top lists every run, great for 30-min cron)
+ranking_alert:
+  enabled: true
+  top_n: 10
