@@ -164,7 +164,7 @@ def main():
         print("Missing ALPACA_KEY_ID / ALPACA_SECRET_KEY")
         sys.exit(1)
     cfg = load_cfg()
-    now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    now_utc = pd.Timestamp.now(tz="UTC")
 
     # Universe
     all_nyse = get_nyse_symbols(cfg["universe_limit"]*3)
