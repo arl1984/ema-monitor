@@ -1,39 +1,51 @@
-feed: "iex"                  # or "sip" depending on plan
-timeframe: "5Min"            # working TF
-confirm_timeframe: "30Min"   # higher TF slope confirm; "" to disable
+# -------- Data / timeframes --------
+feed: "iex"                 # "iex" or "sip" depending on your plan
+timeframe: "5Min"           # working TF (catches crosses sooner)
+confirm_timeframe: "15Min"  # slower TF slope confirm
 
+# -------- Core indicators --------
 ema_fast: 20
 ema_slow: 50
 rsi_period: 14
 adx_period: 14
-adx_min: 22                  # trend strength gate
+adx_min: 18                 # looser than 22 — admit weaker-but-building trends
 
-price_min: 5.0
-volume_mult: 1.2             # last bar volume vs 20-bar average
+# -------- Price/volume gates --------
+price_min: 3.0              # allow more liquid mid-caps and small caps
+volume_mult: 0.8            # was 1.2; looser to avoid filtering out low-spike bars
 
-# Universe
-universe_limit: 800          # initial pull (x3 inside script)
-universe_top_n: 300          # rank by today's dollar volume, then filter by RVOL
-rvol_min: 1.5
+# -------- Universe (wider, then filter) --------
+universe_exchanges: ["NYSE","NASDAQ","AMEX"]
+universe_limit: 3000        # initial pull
+universe_top_n: 800         # rank by $ volume, then filter by RVOL
+
+# -------- RVOL --------
+rvol_min: 1.2               # was 1.5; easier entry, still weeds out dead tickers
 rvol_lookback_days: 30
+rvol_use_same_weekday: true # normalize for weekday volume patterns
 
-# Signal logic
-signal_lookback_hours: 6     # if last_run.json missing, search last N hours
-min_score: 2.0               # composite threshold for signal alerts
-ranking_min_score: 1.75      # lower bar for ranking lists
+# -------- Signal logic --------
+signal_lookback_hours: 8    # longer lookback if last_run.json missing
+allow_persistent: true      # fire once/day if state still valid, even w/o new cross
+bull_rsi_min: 52            # softer than 55+; slightly above neutral
+bear_rsi_max: 48            # mirror, slightly below neutral
+min_score: 1.8              # was 2.0; lets borderline setups through
+ranking_min_score: 1.6      # was 1.75; keep top lists populated
 max_alerts_per_run: 25
 dedupe_window_days: 5
 
+# -------- Regular hours --------
 regular_hours:
   start: "09:30"
   end:   "16:00"
   tz:    "America/New_York"
 
-# Webhook
-webhook_type: "discord"      # slack | discord | generic
-webhook_url: ""
+# -------- Output / Webhook --------
+signals_csv: "data/signals.csv"
+webhook_type: "discord"     # slack | discord | generic
+webhook_url: ""             # or set via env
 
-# Optional ranking alert (top lists every run, great for 30-min cron)
+# -------- Optional ranking alert (top lists every run) --------
 ranking_alert:
   enabled: true
   top_n: 10
