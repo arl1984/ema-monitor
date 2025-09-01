@@ -33,27 +33,23 @@ jobs:
         run: |
           python -m pip install -r requirements.txt
 
-      # Step-level 'if:' cannot reference secrets.*.
-      # We inject the secret as an env var and self-skip if it's empty.
+      # Uses 'shell: python' so we avoid bash heredoc pitfalls.
       - name: Test Discord webhook (optional)
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        shell: bash
+        shell: python
         run: |
-          if [ -n "${WEBHOOK_URL}" ]; then
-            python - << 'PY'
-            import os, requests
-            url = os.environ.get('WEBHOOK_URL', '')
-            try:
-                r = requests.post(url, json={"content":"✅ Test from GitHub Actions (no trading signal)."}, timeout=10)
-                r.raise_for_status()
-                print("Posted test:", r.status_code)
-            except Exception as e:
-                print("Webhook test failed:", e)
-            PY
-          else
-            echo "No WEBHOOK_URL secret set; skipping test."
-          fi
+          import os, requests, sys
+          url = os.environ.get("WEBHOOK_URL", "")
+          if not url:
+              print("No WEBHOOK_URL secret set; skipping test.")
+              sys.exit(0)
+          try:
+              r = requests.post(url, json={"content":"✅ Test from GitHub Actions (no trading signal)."}, timeout=10)
+              r.raise_for_status()
+              print("Posted test:", r.status_code)
+          except Exception as e:
+              print("Webhook test failed:", e)
 
       - name: Run monitor
         env:
