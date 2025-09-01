@@ -28,6 +28,7 @@ jobs:
         env:
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_ENV: ${{ vars.ALPACA_ENV }}   # should resolve to 'paper'
         run: |
           python monitor.py
       - name: Commit logs/artifacts
