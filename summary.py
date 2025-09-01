@@ -84,6 +84,8 @@ def send_webhook(cfg, text: str):
 
 def main(kind: str):
     cfg = load_cfg()
+    cfg["webhook_url"]  = os.getenv("WEBHOOK_URL",  cfg.get("webhook_url",""))
+    cfg["webhook_type"] = os.getenv("WEBHOOK_TYPE", cfg.get("webhook_type","discord"))
     df = load_signals()
     now_ct = ct_now()
     if kind == "daily":
