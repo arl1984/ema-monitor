@@ -10,6 +10,7 @@ from typing import List, Dict
 ALPACA_KEY   = os.environ.get("ALPACA_KEY_ID", "")
 ALPACA_SECRET= os.environ.get("ALPACA_SECRET_KEY", "")
 BASE_DATA    = "https://data.alpaca.markets/v2"
+ALPACA_ENV = os.environ.get("ALPACA_ENV", "paper").lower()  # 'paper' or 'live'
 BASE_BROKER  = "https://api.alpaca.markets/v2"  # for /assets
 HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
