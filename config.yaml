@@ -11,7 +11,7 @@ adx_period: 14
 adx_min: 22                  # stricter trend-strength gate
 
 # -------- Price/volume gates --------
-price_min: 5.0               # filter out illiquid/small low-priced names
+price_min: 10.0              # filter out illiquid/small low-priced names
 volume_mult: 1.0             # require at/above 20-bar avg volume on the signal bar
 
 # -------- Universe (narrower, then filter) --------
