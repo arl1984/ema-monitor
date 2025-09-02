@@ -1,5 +1,5 @@
 # -------- Data / timeframes --------
-feed: "sip"                  # consolidated tape — best for reliable $volume ranking
+feed: "iex"                  # consolidated tape — best for reliable $volume ranking
 timeframe: "5Min"            # short TF for timely detection
 confirm_timeframe: "1Hour"   # much slower TF slope confirm — enforces multi-hour alignment
 
