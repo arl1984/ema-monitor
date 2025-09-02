@@ -1,5 +1,5 @@
 # -------- Data / timeframes --------
-feed: "sip"                  # prefer SIP for accurate $volume-based ranking (use "iex" if SIP unavailable)
+feed: "iex"                  # prefer SIP for accurate $volume-based ranking (use "iex" if SIP unavailable)
 timeframe: "5Min"            # keep detection timely
 confirm_timeframe: "30Min"   # slower TF slope confirm for stronger trends
 
