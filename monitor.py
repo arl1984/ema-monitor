@@ -298,7 +298,7 @@ def compute_rvol_for(symbols: List[str], feed: str, now_utc: pd.Timestamp, lookb
     if daily.empty:
         return {s: 1.0 for s in symbols}
     daily["date_et"] = daily["t"].dt.tz_convert(EASTERN_TZ).dt.date
-    daily["weekday"] = pd.to_datetime(daily["date_et"]).weekday
+    daily["weekday"] = pd.to_datetime(daily["date_et"]).dt.weekday
     for sym, g in daily.groupby("symbol"):
         dvol = g.groupby("date_et")["v"].sum().sort_index()
         if len(dvol) < 5:
