@@ -1,38 +1,80 @@
 # -------- Data / timeframes --------
-feed: "iex"                  # consolidated tape — best for reliable $volume ranking
-timeframe: "5Min"            # short TF for timely detection
-confirm_timeframe: "1Hour"   # much slower TF slope confirm — enforces multi-hour alignment
+feed: "iex"                  # "iex" or "sip"
+timeframe: "1Min"            # faster working TF for earlier pings
+confirm_timeframe: "5Min"    # slower TF slope confirm (filters noise)
 
 # -------- Core indicators --------
 ema_fast: 20
 ema_slow: 50
 rsi_period: 14
 adx_period: 14
-adx_min: 25                  # demand very strong trend strength
+adx_min: 18                  # loose by default
 
 # -------- Price/volume gates --------
-price_min: 10.0              # filter out cheap/illiquid names entirely
-volume_mult: 1.2             # require 20%+ above 20-bar avg volume at signal
+price_min: 3.0
+volume_mult: 0.8
 
-# -------- Universe (narrow + liquid) --------
-universe_exchanges: ["NYSE","NASDAQ"]  # stick to most liquid venues
-universe_limit: 2000
-universe_top_n: 300          # only top 300 by $volume considered before RVOL
+# -------- Universe (wide, then filter) --------
+universe_exchanges: ["NYSE","NASDAQ","AMEX"]
+universe_limit: 3000
+universe_top_n: 800
 
 # -------- RVOL --------
-rvol_min: 1.6                # much higher — only unusually heavy volume
+rvol_min: 1.2
 rvol_lookback_days: 30
-rvol_use_same_weekday: true  # weekday-normalized
+rvol_use_same_weekday: true
 
-# -------- Signal logic --------
-signal_lookback_hours: 4     # short window — only very recent crosses
-allow_persistent: true       # still allow, but thresholds are higher
-bull_rsi_min: 58             # strong bullish momentum only
-bear_rsi_max: 42             # strong bearish momentum only
-min_score: 2.3               # very high composite threshold
-ranking_min_score: 2.0       # stricter ranking threshold
-max_alerts_per_run: 10       # keep alerts very limited
-dedupe_window_days: 7        # dedupe over a full week
+# -------- Early / predictive-ish signals --------
+early_alerts_max: 30  # cap early heads-up alerts per run
+
+near_cross:
+  enabled: true
+  eps_pct: 0.002       # within 0.2% of spread=0
+  lookback: 3
+  adx_rising: true
+  rsi_floor_bull: 48
+  rsi_ceiling_bear: 52
+
+macd_early:
+  enabled: true
+  lookback: 3
+  adx_rising: true
+  rsi_floor_bull: 48
+  rsi_ceiling_bear: 52
+  macd_fast: 12       # (used by code defaults too)
+  macd_slow: 26
+  macd_signal: 9
+
+rsi_regime:
+  enabled: true
+  lookback: 3
+  adx_rising: true
+  bull_threshold: 60   # crossing above for bulls
+  bear_threshold: 40   # crossing below for bears
+
+vwap_reclaim:
+  enabled: true
+  lookback: 3          # require last N bars were on the other side
+  vol_spike_mult: 1.2  # bar volume vs 20-bar avg
+  adx_rising: true
+
+squeeze_breakout:
+  enabled: true
+  lookback: 5
+  min_width: 0.02      # “tight” band width threshold
+  adx_rising: true
+  bb_period: 20
+  bb_k: 2.0
+
+# -------- Signal logic (classic crosses & rankings) --------
+signal_lookback_hours: 8
+allow_persistent: true
+bull_rsi_min: 52
+bear_rsi_max: 48
+min_score: 1.8
+ranking_min_score: 1.6
+max_alerts_per_run: 25
+dedupe_window_days: 5
 
 # -------- Regular hours --------
 regular_hours:
@@ -42,22 +84,22 @@ regular_hours:
 
 # -------- Output / Webhook --------
 signals_csv: "data/signals.csv"
-webhook_type: "discord"      # slack | discord | generic
-webhook_url: ""              # set via env
+webhook_type: "discord"
+webhook_url: ""
 
 # -------- Health / telemetry --------
 health:
   enabled: true
-  min_universe: 100                # expect a decent liquid universe even when strict
-  min_symbols_with_bars: 75
-  min_bar_coverage_pct: 80         # require very high coverage
+  min_universe: 50
+  min_symbols_with_bars: 30
+  min_bar_coverage_pct: 60
   warn_on_empty_signals: true
 
 stats_report:
   enabled: true
-  level: "verbose"                 # show ratelimit + error counts too
+  level: "compact"
 
-# -------- Optional ranking alert --------
+# -------- Ranking snapshot --------
 ranking_alert:
   enabled: true
-  top_n: 5                         # only surface top 5 bull/bear candidates
+  top_n: 10
