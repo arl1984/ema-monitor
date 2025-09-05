@@ -48,14 +48,12 @@ METRICS = {
 # ---------- HTTP w/ retries ----------
 def http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None,
              timeout: int = 60, max_retries: int = 3) -> requests.Response:
-    """GET with retries on 429/5xx, exp backoff + jitter, and telemetry."""
     attempt = 0
     last_exc = None
     while attempt <= max_retries:
         try:
             r = requests.get(url, headers=headers, params=params, timeout=timeout)
             METRICS["http_gets"] += 1
-            # track rate limits when provided
             METRICS["rate_limit_remaining"] = r.headers.get("X-RateLimit-Remaining", METRICS["rate_limit_remaining"])
             METRICS["rate_limit_reset"] = r.headers.get("X-RateLimit-Reset", METRICS["rate_limit_reset"])
             if r.status_code in (429, 500, 502, 503, 504):
@@ -73,13 +71,12 @@ def http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = 
     METRICS["errors"].append(str(last_exc))
     raise last_exc if last_exc else RuntimeError("HTTP GET failed unexpectedly")
 
-# ---------- File lock (best-effort, cross-platform) ----------
+# ---------- File lock ----------
 class FileLock:
     def __init__(self, path: str):
         self.lock_path = path + ".lock"
         self.fh = None
         self._is_windows = os.name == "nt"
-
     def __enter__(self):
         os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
         self.fh = open(self.lock_path, "a+")
@@ -93,22 +90,17 @@ class FileLock:
         except Exception as e:
             log(f"[lock] non-fatal: {e}")
         return self
-
     def __exit__(self, exc_type, exc, tb):
         try:
             if self.fh:
                 if self._is_windows:
                     import msvcrt
-                    try:
-                        msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
-                    except Exception:
-                        pass
+                    try: msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception: pass
                 else:
                     import fcntl
-                    try:
-                        fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
-                    except Exception:
-                        pass
+                    try: fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+                    except Exception: pass
                 self.fh.close()
         except Exception:
             pass
@@ -164,14 +156,11 @@ def adx_df(df: pd.DataFrame, period=14) -> pd.Series:
 def vwap_series(df: pd.DataFrame) -> pd.Series:
     tp = (df["h"] + df["l"] + df["c"]) / 3.0
     pv = tp * df["v"]
-    cum_pv = pv.cumsum()
-    cum_v  = df["v"].cumsum()
-    return cum_pv / cum_v.replace(0, np.nan)
+    return pv.cumsum() / df["v"].cumsum().replace(0, np.nan)
 
 def is_rth(ts_utc: pd.Timestamp, start="09:30", end="16:00", tzname="America/New_York"):
     et = ts_utc.tz_convert(tz.gettz(tzname))
-    sh,sm = map(int, start.split(":"))
-    eh,em = map(int, end.split(":"))
+    sh,sm = map(int, start.split(":")); eh,em = map(int, end.split(":"))
     t = et.time()
     return (t >= datetime(et.year,et.month,et.day,sh,sm).time() and
             t <= datetime(et.year,et.month,et.day,eh,em).time())
@@ -195,7 +184,6 @@ def get_et_midnight_bounds(now_utc: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Time
 
 # ---------- Alpaca fetch ----------
 def get_us_equities(limit_universe:int, exchanges: List[str]) -> List[str]:
-    """Pull active US equities across configured exchanges via Alpaca /assets."""
     try:
         r = http_get(f"{BASE_BROKER}/assets", headers=HEADERS, timeout=30)
     except Exception as e:
@@ -263,15 +251,13 @@ def fetch_daily_bars(symbols: List[str], start_iso: str, end_iso: str, feed: str
 # ---------- Universe ranking ----------
 def rank_by_today_dollar_vol(symbols: List[str], tf: str, feed: str, now_utc: pd.Timestamp, top_n: int) -> pd.DataFrame:
     start_utc, end_utc = get_et_midnight_bounds(now_utc)
-    start_iso, end_iso = start_utc.isoformat(), end_utc.isoformat()
     rows = []
     chunk = 50
     for i in range(0, len(symbols), chunk):
         part = symbols[i:i+chunk]
-        bars = fetch_bars_chunk(part, start_iso, end_iso, tf, feed)
+        bars = fetch_bars_chunk(part, start_utc.isoformat(), end_utc.isoformat(), tf, feed)
         log(f"[rank$] chunk symbols={len(part)} rows={0 if bars is None else len(bars)}")
-        if bars.empty:
-            continue
+        if bars.empty: continue
         g = bars.groupby("symbol")
         for sym, df in g:
             dollar_vol = float((df["c"] * df["v"]).sum())
@@ -283,7 +269,6 @@ def rank_by_today_dollar_vol(symbols: List[str], tf: str, feed: str, now_utc: pd
     return ranked
 
 def compute_rvol_for(symbols: List[str], feed: str, now_utc: pd.Timestamp, lookback_days=30, use_same_weekday=True) -> Dict[str, float]:
-    """RVOL = today volume / median(past volumes). Optionally same-weekday median to reduce weekday seasonality."""
     end_utc = now_utc
     start_utc = now_utc - timedelta(days=lookback_days+10)
     daily = pd.DataFrame()
@@ -317,18 +302,49 @@ def compute_rvol_for(symbols: List[str], feed: str, now_utc: pd.Timestamp, lookb
         rvol_map[sym] = float(today_vol / med) if med and med > 0 else 1.0
     return rvol_map
 
-# ---------- Technicals / signals ----------
+# ---------- Technicals / indicators ----------
 def enrich_with_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     df = df.sort_values("t").copy()
+
+    # EMAs & spread
     df["ema_fast"] = ema(df["c"], cfg["ema_fast"])
     df["ema_slow"] = ema(df["c"], cfg["ema_slow"])
+    df["spread"] = df["ema_fast"] - df["ema_slow"]
+    df["spread_pct"] = df["spread"] / df["ema_slow"].replace(0, np.nan)
+    df["spread_roc"] = df["spread"].diff()
+
+    # RSI/ADX
     df["rsi"] = rsi(df["c"], cfg["rsi_period"])
-    df["vol_ma20"] = df["v"].rolling(20, min_periods=1).mean()
     df["adx"] = adx_df(df, period=cfg.get("adx_period",14))
-    spread = df["ema_fast"] - df["ema_slow"]
-    sign = np.sign(spread)
+
+    # Volume stats
+    df["vol_ma20"] = df["v"].rolling(20, min_periods=1).mean()
+
+    # Bollinger for squeeze
+    bb_len = int(cfg.get("bb_period", 20))
+    bb_k = float(cfg.get("bb_k", 2.0))
+    mid = df["c"].rolling(bb_len, min_periods=1).mean()
+    std = df["c"].rolling(bb_len, min_periods=1).std()
+    df["bb_mid"] = mid
+    df["bb_up"]  = mid + bb_k*std
+    df["bb_dn"]  = mid - bb_k*std
+    df["bb_width"] = (df["bb_up"] - df["bb_dn"]) / df["bb_mid"].replace(0, np.nan)
+
+    # MACD (classic 12/26/9 on close)
+    macd_fast = int(cfg.get("macd_fast", 12))
+    macd_slow = int(cfg.get("macd_slow", 26))
+    macd_sig  = int(cfg.get("macd_signal", 9))
+    df["ema_f_macd"] = ema(df["c"], macd_fast)
+    df["ema_s_macd"] = ema(df["c"], macd_slow)
+    df["macd"] = df["ema_f_macd"] - df["ema_s_macd"]
+    df["macd_signal"] = ema(df["macd"], macd_sig)
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    # Cross flags (20/50)
+    sign = np.sign(df["spread"])
     df["bull_cross"] = (sign.shift(1) <= 0) & (sign > 0)
     df["bear_cross"] = (sign.shift(1) >= 0) & (sign < 0)
+
     return df
 
 def session_vwap(df: pd.DataFrame, now_utc: pd.Timestamp) -> pd.Series:
@@ -337,8 +353,7 @@ def session_vwap(df: pd.DataFrame, now_utc: pd.Timestamp) -> pd.Series:
     if dft.empty:
         return pd.Series(index=df.index, dtype=float)
     vwap = vwap_series(dft)
-    vw = vwap.reindex(df.index, method="ffill")
-    return vw
+    return vwap.reindex(df.index, method="ffill")
 
 def slope_positive(series: pd.Series) -> bool:
     if len(series) < 2: return False
@@ -365,29 +380,27 @@ def fetch_confirm_slope(symbols: List[str], timeframe: str, feed: str, now_utc: 
         out[sym] = (up, down)
     return out
 
+# ---------- Scoring ----------
 def composite_score(row, rvol: float, is_bull: bool, cfg: dict, ema50=None, ema200=None, vwap=None) -> float:
     score = 0.0
     adx_val = float(row.get("adx", np.nan))
     if not np.isfinite(adx_val) or adx_val < cfg["adx_min"]:
         return -1.0
-    score += min(max((rvol - 1.0), 0.0), 2.0)  # RVOL (0..2)
-    score += 1.0                                # ADX passed
+    score += min(max((rvol - 1.0), 0.0), 2.0)   # 0..2 from RVOL
+    score += 1.0                                 # ADX passed
     if ema50 is not None and ema200 is not None:
-        if is_bull and (row["c"] > ema50 > ema200):
-            score += 0.5
-        if (not is_bull) and (row["c"] < ema50 < ema200):
-            score += 0.5
+        if is_bull and (row["c"] > ema50 > ema200): score += 0.5
+        if (not is_bull) and (row["c"] < ema50 < ema200): score += 0.5
     if vwap is not None and np.isfinite(vwap):
-        if is_bull and (row["c"] > vwap):
-            score += 0.5
-        if (not is_bull) and (row["c"] < vwap):
-            score += 0.5
+        if is_bull and (row["c"] > vwap): score += 0.5
+        if (not is_bull) and (row["c"] < vwap): score += 0.5
     try:
         score += 0.25 if (row["ema_fast"] - row["ema_slow"]) / max(abs(row["ema_slow"]), 1e-9) > 0.0025 else 0.0
     except Exception:
         pass
     return float(score)
 
+# ---------- IO helpers ----------
 def load_last_run_time(now_utc: pd.Timestamp, default_hours: int) -> pd.Timestamp:
     meta = load_json("data/last_run.json")
     if meta and "run_time_utc" in meta:
@@ -402,7 +415,7 @@ def read_signals_csv(path="data/signals.csv") -> pd.DataFrame:
     try:
         return pd.read_csv(path)
     except Exception:
-        return pd.DataFrame(columns=["ticker","last_price","timestamp","direction","session","id","score","rvol","adx"])
+        return pd.DataFrame(columns=["ticker","last_price","timestamp","direction","session","id","score","rvol","adx","kind"])
 
 def make_signal_id(ticker:str, direction:str, iso_ts:str) -> str:
     return f"{ticker}|{direction}|{iso_ts}"
@@ -410,35 +423,27 @@ def make_signal_id(ticker:str, direction:str, iso_ts:str) -> str:
 # ---------- Webhook ----------
 def send_webhook(cfg, payload_text: Optional[str]=None, payload_obj: Optional[dict]=None):
     url = cfg.get("webhook_url","")
-    if not url:
-        return
+    if not url: return
     typ = cfg.get("webhook_type","generic").lower()
     try:
         if typ == "slack":
-            if payload_text:
-                requests.post(url, json={"text": payload_text}, timeout=10)
-            elif payload_obj:
-                requests.post(url, json=payload_obj, timeout=10)
+            body = {"text": payload_text} if payload_text else (payload_obj or {})
+            requests.post(url, json=body, timeout=10)
         elif typ == "discord":
-            if payload_text:
-                requests.post(url, json={"content": payload_text}, timeout=10)
-            elif payload_obj:
-                requests.post(url, json=payload_obj, timeout=10)
+            body = {"content": payload_text} if payload_text else (payload_obj or {})
+            requests.post(url, json=body, timeout=10)
         else:
-            obj = payload_obj if payload_obj else {"text": payload_text}
-            requests.post(url, json=obj, timeout=10)
+            body = payload_obj if payload_obj else {"text": payload_text}
+            requests.post(url, json=body, timeout=10)
     except Exception as e:
         print("Webhook error:", e, file=sys.stderr)
 
-# ---------- Health / stats helpers ----------
+# ---------- Health / stats ----------
 def send_health_webhook(cfg, text: str, extra: Optional[dict]=None):
     payload = {"content": text} if cfg.get("webhook_type","discord") == "discord" else {"text": text}
-    if extra:
-        payload.update(extra)
-    try:
-        send_webhook(cfg, payload_text=text)
-    except Exception as e:
-        log(f"[health webhook] failed: {e}")
+    if extra: payload.update(extra)
+    try: send_webhook(cfg, payload_text=text)
+    except Exception as e: log(f"[health webhook] failed: {e}")
 
 def summarize_stats_text(level: str, universe_size: int, signals_count: int) -> str:
     dur = None
@@ -447,24 +452,19 @@ def summarize_stats_text(level: str, universe_size: int, signals_count: int) -> 
             dur = (pd.Timestamp(METRICS["run_finished_utc"]) - pd.Timestamp(METRICS["run_started_utc"])).total_seconds()
     except Exception:
         pass
-    coverage_pct = 0.0
-    if universe_size > 0:
-        coverage_pct = 100.0 * (METRICS["symbols_with_bars"] / max(universe_size,1))
+    coverage_pct = 100.0 * (METRICS["symbols_with_bars"] / max(universe_size,1)) if universe_size else 0.0
     header = f"🩺 Scan stats — analyzed={METRICS['symbols_with_bars']}/{universe_size} ({coverage_pct:.1f}%) | bars={METRICS['bars_rows']} | pages={METRICS['pages_fetched']} | http={METRICS['http_gets']} | signals={signals_count}"
-    if dur is not None:
-        header += f" | duration={dur:.1f}s"
+    if dur is not None: header += f" | duration={dur:.1f}s"
     if level == "verbose":
         header += f"\nrate_limit_remaining={METRICS['rate_limit_remaining']} reset={METRICS['rate_limit_reset']} errors={len(METRICS['errors'])}"
     return header
 
 def health_check(cfg, universe_size: int, symbols_with_bars: int) -> Tuple[bool, str]:
     h = cfg.get("health", {}) or {}
-    if not h.get("enabled", True):
-        return True, ""
+    if not h.get("enabled", True): return True, ""
     min_uni = h.get("min_universe", 50)
     min_sym_bars = h.get("min_symbols_with_bars", 30)
     min_cov = h.get("min_bar_coverage_pct", 60)
-
     if universe_size < min_uni:
         return False, f"⚠️ Degraded run: universe too small ({universe_size} < {min_uni})."
     coverage_pct = 100.0 * (symbols_with_bars / max(universe_size,1))
@@ -477,15 +477,9 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
     now_utc = utc_now()
     # per-run metrics baseline
     METRICS.update({
-        "http_gets": 0,
-        "pages_fetched": 0,
-        "symbols_requested": 0,
-        "symbols_with_bars": 0,
-        "bars_rows": 0,
-        "universe_size": 0,
-        "run_started_utc": now_utc.isoformat(),
-        "run_finished_utc": None,
-        "errors": []
+        "http_gets": 0, "pages_fetched": 0, "symbols_requested": 0,
+        "symbols_with_bars": 0, "bars_rows": 0, "universe_size": 0,
+        "run_started_utc": now_utc.isoformat(), "run_finished_utc": None, "errors": []
     })
 
     # allow env to override webhook
@@ -555,6 +549,7 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
 
     # Enrich per-symbol with indicators and session VWAP
     out_signals = []
+    early_signals = []  # keep “predictive-ish” separate for formatting
     rankings_bull, rankings_bear = [], []
 
     last_run_cutoff_hours = cfg.get("signal_lookback_hours", 8)
@@ -576,11 +571,29 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
     if confirm_tf:
         confirm_map = fetch_confirm_slope(universe, confirm_tf, cfg["feed"], now_utc, ema_slow_len)
 
-    # Precompute RVOL again for final universe if we didn't have it above (override provided)
+    # If override tickers, compute rvol_map now
     if override_tickers:
         rvol_map = compute_rvol_for(universe, cfg["feed"], now_utc,
                                     lookback_days=cfg["rvol_lookback_days"],
                                     use_same_weekday=rvol_same_wd)
+
+    # Helper to push a signal dict
+    def push_signal(container, sym, row, direction, rvol_value, kind):
+        ts_iso_ct = row["t"].tz_convert(CENTRAL_TZ).isoformat()
+        sig_id = f"{sym}|{kind}-{direction}|{ts_iso_ct}"
+        if not prev_signals_df.empty and "id" in prev_signals_df.columns:
+            if (prev_signals_df["id"] == sig_id).any():
+                return
+        session = "regular" if is_rth(
+            row["t"], cfg["regular_hours"]["start"], cfg["regular_hours"]["end"], cfg["regular_hours"]["tz"]
+        ) else "extended"
+        sc = composite_score(row, rvol_value, direction=="bullish", cfg, row.get("ema50"), row.get("ema200"), row.get("sess_vwap"))
+        container.append({
+            "ticker": sym, "last_price": round(float(row["c"]), 4),
+            "timestamp": ts_iso_ct, "direction": direction, "session": session,
+            "id": sig_id, "score": round(float(sc), 3), "rvol": round(rvol_value, 2),
+            "adx": round(float(row.get("adx", np.nan)), 2), "kind": kind
+        })
 
     # Per-symbol loop
     for sym, g in allbars.groupby("symbol"):
@@ -592,223 +605,15 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
             continue
 
         slope_up, slope_down = confirm_map.get(sym, (True, True))
-
         recent = g[g["t"] >= last_run_cutoff]
         crosses = recent[(recent["bull_cross"]) | (recent["bear_cross"])]
+
+        # RVOL for latest bar
+        last = g.iloc[-1]
+        rvol_last = float(rvol_map.get(sym, 1.0))
+        vol_ok_last = last["v"] >= volume_mult * last["vol_ma20"]
+
+        # ---------------- Traditional cross alerts ----------------
         for _, row in crosses.iterrows():
             is_bull = bool(row["bull_cross"])
-            if row["c"] <= cfg["price_min"]:
-                continue
-            if row["v"] < volume_mult * row["vol_ma20"]:
-                continue
-            if is_bull and row["rsi"] <= bull_rsi_min:
-                continue
-            if (not is_bull) and row["rsi"] >= bear_rsi_max:
-                continue
-            if float(row.get("adx", np.nan)) < cfg["adx_min"]:
-                continue
-            if confirm_tf:
-                if is_bull and not slope_up: 
-                    continue
-                if (not is_bull) and not slope_down:
-                    continue
-            rvol = float(rvol_map.get(sym, 1.0))
-            if rvol < cfg["rvol_min"]:
-                continue
-
-            score = composite_score(
-                row,
-                rvol=rvol,
-                is_bull=is_bull,
-                cfg=cfg,
-                ema50=row.get("ema50"),
-                ema200=row.get("ema200"),
-                vwap=row.get("sess_vwap")
-            )
-            if score < cfg.get("min_score", 1.8):
-                continue
-
-            ts_iso_ct = row["t"].tz_convert(CENTRAL_TZ).isoformat()
-            sig_id = make_signal_id(sym, "bullish" if is_bull else "bearish", ts_iso_ct)
-            if not prev_signals_df.empty and "id" in prev_signals_df.columns:
-                if (prev_signals_df["id"] == sig_id).any():
-                    continue
-
-            session = "regular" if is_rth(
-                row["t"],
-                cfg["regular_hours"]["start"],
-                cfg["regular_hours"]["end"],
-                cfg["regular_hours"]["tz"]
-            ) else "extended"
-
-            out_signals.append({
-                "ticker": sym,
-                "last_price": round(float(row["c"]), 4),
-                "timestamp": ts_iso_ct,
-                "direction": "bullish" if is_bull else "bearish",
-                "session": session,
-                "id": sig_id,
-                "score": round(score, 3),
-                "rvol": round(rvol, 2),
-                "adx": round(float(row["adx"]), 2)
-            })
-
-        # Optional persistent-state alert
-        if cfg.get("allow_persistent", True) and crosses.empty:
-            last = g.iloc[-1]
-            if last["c"] > cfg["price_min"]:
-                rvol_last = float(rvol_map.get(sym, 1.0))
-                if rvol_last >= cfg["rvol_min"] and float(last.get("adx", np.nan)) >= cfg["adx_min"]:
-                    bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > bull_rsi_min)
-                    bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < bear_rsi_max)
-                    if confirm_tf:
-                        bull_ctx = bull_ctx and slope_up
-                        bear_ctx = bear_ctx and slope_down
-                    if bull_ctx or bear_ctx:
-                        sc = composite_score(last, rvol_last, bull_ctx, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
-                        direction = "bullish" if bull_ctx else "bearish"
-                        today_tag = str(today_et(now_utc))
-                        sig_id = f"{sym}|{direction}|persistent|{today_tag}"
-                        already = (not prev_signals_df.empty and "id" in prev_signals_df.columns and (prev_signals_df["id"] == sig_id).any())
-                        if (not already) and sc >= cfg.get("min_score", 1.8):
-                            ts_iso_ct = last["t"].tz_convert(CENTRAL_TZ).isoformat()
-                            session = "regular" if is_rth(
-                                last["t"],
-                                cfg["regular_hours"]["start"],
-                                cfg["regular_hours"]["end"],
-                                cfg["regular_hours"]["tz"]
-                            ) else "extended"
-                            out_signals.append({
-                                "ticker": sym,
-                                "last_price": round(float(last["c"]), 4),
-                                "timestamp": ts_iso_ct,
-                                "direction": direction,
-                                "session": session,
-                                "id": sig_id,
-                                "score": round(float(sc), 3),
-                                "rvol": round(rvol_last, 2),
-                                "adx": round(float(last.get("adx", np.nan)), 2)
-                            })
-
-        # Ranking snapshot (no cross required)
-        last = g.iloc[-1]
-        if last["c"] <= cfg["price_min"]:
-            continue
-        rvol_last = float(rvol_map.get(sym, 1.0))
-        if rvol_last < cfg["rvol_min"]:
-            continue
-        bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > bull_rsi_min)
-        bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < bear_rsi_max)
-        if confirm_tf:
-            bull_ctx = bull_ctx and slope_up
-            bear_ctx = bear_ctx and slope_down
-        if bull_ctx:
-            sc = composite_score(last, rvol_last, True, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
-            if sc >= cfg.get("ranking_min_score", 1.6):
-                rankings_bull.append((sym, float(last["c"]), float(sc), float(rvol_last), float(last.get("adx", np.nan))))
-        if bear_ctx:
-            sc = composite_score(last, rvol_last, False, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
-            if sc >= cfg.get("ranking_min_score", 1.6):
-                rankings_bear.append((sym, float(last["c"]), float(sc), float(rvol_last), float(last.get("adx", np.nan))))
-
-    # Sort rankings
-    rankings_bull.sort(key=lambda x: (-x[2], -x[3]))
-    rankings_bear.sort(key=lambda x: (-x[2], -x[3]))
-
-    # Limit outgoing alerts
-    max_alerts = cfg.get("max_alerts_per_run", 25)
-    out_signals = sorted(out_signals, key=lambda s: -s["score"])[:max_alerts]
-
-    log(f"[signals] total={len(out_signals)}  rankings: bull={len(rankings_bull)} bear={len(rankings_bear)}")
-
-    meta = {
-        "run_time_utc": now_utc.isoformat(),
-        "universe_size": len(universe),
-        "signals_count": len(out_signals),
-        "sample_symbols": universe[:10]
-    }
-
-    # Health + stats reporting (always before sending signals)
-    ok, warn_msg = health_check(cfg, METRICS["universe_size"], METRICS["symbols_with_bars"])
-    if not ok:
-        send_health_webhook(cfg, warn_msg)
-    if cfg.get("stats_report",{}).get("enabled", True):
-        text = summarize_stats_text(cfg.get("stats_report",{}).get("level","compact"),
-                                    METRICS["universe_size"], len(out_signals))
-        send_health_webhook(cfg, text)
-    if len(out_signals) == 0 and cfg.get("health",{}).get("warn_on_empty_signals", True):
-        send_health_webhook(cfg, "ℹ️ No qualifying signals this scan (filters may be tight or just a quiet window).")
-
-    # Output / side effects
-    if dry_run:
-        print({
-            **meta,
-            "top_bull": rankings_bull[:10],
-            "top_bear": rankings_bear[:10],
-        })
-        METRICS["run_finished_utc"] = utc_now().isoformat()
-        return
-
-    # Send new signals & write CSV (with lock)
-    if out_signals:
-        os.makedirs(os.path.dirname(cfg.get("signals_csv","data/signals.csv")), exist_ok=True)
-        df = pd.DataFrame(out_signals)
-        csv_path = cfg.get("signals_csv","data/signals.csv")
-        with FileLock(csv_path):
-            if os.path.exists(csv_path):
-                df.to_csv(csv_path, mode="a", header=False, index=False)
-            else:
-                df.to_csv(csv_path, index=False)
-
-        # Webhook text
-        def fmt(s):
-            return f"**{s['ticker']}** {s['direction'].upper()} @ ${s['last_price']} — {s['timestamp']} ({s['session']}) | score {s['score']} | RVOL {s['rvol']} | ADX {s['adx']}"
-        text = "\n".join(fmt(s) for s in out_signals)
-        send_webhook(cfg, payload_text=f"📈 US 20/50 EMA crosses & setups (since last run)\n{text}")
-
-    # Ranking snapshot (optional)
-    rank_cfg = cfg.get("ranking_alert", {"enabled": False})
-    if rank_cfg and rank_cfg.get("enabled", False):
-        tb = rankings_bull[: rank_cfg.get("top_n", 10)]
-        trb = "\n".join([f"{i+1}. **{t}** ${p:.2f} | score {s:.2f} | RVOL {rv:.2f} | ADX {ax:.1f}"
-                         for i,(t,p,s,rv,ax) in enumerate(tb)])
-        te = rankings_bear[: rank_cfg.get("top_n", 10)]
-        tre = "\n".join([f"{i+1}. **{t}** ${p:.2f} | score {s:.2f} | RVOL {rv:.2f} | ADX {ax:.1f}"
-                         for i,(t,p,s,rv,ax) in enumerate(te)])
-        msg = "🏁 **Top Trending (composite score)**\n**BULLISH**\n" + (trb or "_none_") + "\n\n**BEARISH**\n" + (tre or "_none_")
-        send_webhook(cfg, payload_text=msg)
-
-    # Save meta / last run
-    os.makedirs("data", exist_ok=True)
-    save_json("data/last_run.json", meta)
-
-    METRICS["run_finished_utc"] = utc_now().isoformat()
-    print(meta)
-
-# ---------- CLI ----------
-def main():
-    if not (ALPACA_KEY and ALPACA_SECRET):
-        print("Missing ALPACA_KEY_ID / ALPACA_SECRET_KEY")
-        sys.exit(1)
-
-    cfg = load_cfg()
-    # sensible defaults if missing
-    cfg.setdefault("universe_exchanges", ["NYSE","NASDAQ","AMEX"])
-    cfg.setdefault("bull_rsi_min", 52)
-    cfg.setdefault("bear_rsi_max", 48)
-    cfg.setdefault("volume_mult", 0.8)
-    cfg.setdefault("rvol_use_same_weekday", True)
-    cfg.setdefault("allow_persistent", True)
-    cfg.setdefault("min_score", 1.8)
-    cfg.setdefault("ranking_min_score", 1.6)
-
-    parser = argparse.ArgumentParser(description="US trend monitor (20/50 EMA)")
-    parser.add_argument("--tickers", type=str, default="", help="Comma-separated tickers to override universe (smoke test)")
-    parser.add_argument("--dry-run", action="store_true", help="Run everything but do not send webhook or write CSV")
-    args = parser.parse_args()
-
-    override = [t for t in args.tickers.split(",")] if args.tickers else None
-    run_monitor(cfg, override_tickers=override, dry_run=args.dry_run)
-
-if __name__ == "__main__":
-    main()
+            if row["c"] <= cfg["price]()
