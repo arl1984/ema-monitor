@@ -616,4 +616,260 @@ def run_monitor(cfg, override_tickers: list | None = None, dry_run: bool = False
         # ---------------- Traditional cross alerts ----------------
         for _, row in crosses.iterrows():
             is_bull = bool(row["bull_cross"])
-            if row["c"] <= cfg["price]()
+            if row["c"] <= cfg["price_min"]: continue
+            if row["v"] < volume_mult * row["vol_ma20"]: continue
+            if is_bull and row["rsi"] <= bull_rsi_min: continue
+            if (not is_bull) and row["rsi"] >= bear_rsi_max: continue
+            if float(row.get("adx", np.nan)) < cfg["adx_min"]: continue
+            if confirm_tf:
+                if is_bull and not slope_up:  continue
+                if (not is_bull) and not slope_down: continue
+            rvol_val = float(rvol_map.get(sym, 1.0))
+            if rvol_val < cfg["rvol_min"]: continue
+            sc = composite_score(row, rvol_val, is_bull, cfg, row.get("ema50"), row.get("ema200"), row.get("sess_vwap"))
+            if sc < cfg.get("min_score", 1.8): continue
+            # push to out_signals
+            ts_iso_ct = row["t"].tz_convert(CENTRAL_TZ).isoformat()
+            sig_id = make_signal_id(sym, "bullish" if is_bull else "bearish", ts_iso_ct)
+            if not prev_signals_df.empty and "id" in prev_signals_df.columns:
+                if (prev_signals_df["id"] == sig_id).any(): continue
+            session = "regular" if is_rth(
+                row["t"], cfg["regular_hours"]["start"], cfg["regular_hours"]["end"], cfg["regular_hours"]["tz"]) else "extended"
+            out_signals.append({
+                "ticker": sym, "last_price": round(float(row["c"]), 4),
+                "timestamp": ts_iso_ct, "direction": "bullish" if is_bull else "bearish",
+                "session": session, "id": sig_id,
+                "score": round(sc, 3), "rvol": round(rvol_val, 2), "adx": round(float(row["adx"]), 2),
+                "kind": "cross"
+            })
+
+        # ---------------- Early / predictive-ish signals ----------------
+        # NEAR-CROSS
+        ncfg = cfg.get("near_cross", {"enabled": False})
+        if ncfg.get("enabled", False) and last["c"] > cfg["price_min"] and rvol_last >= cfg["rvol_min"] and vol_ok_last:
+            eps = float(ncfg.get("eps_pct", 0.002))
+            lb  = int(ncfg.get("lookback", 3))
+            roc = g["spread"].tail(lb).diff().mean()
+            adx_ok = (g["adx"].tail(lb).diff().mean() > 0) if ncfg.get("adx_rising", True) else True
+            bull_near = (last["spread_pct"] < 0) and (last["spread_pct"] > -eps) and (roc > 0) and adx_ok and (last["rsi"] >= ncfg.get("rsi_floor_bull", 48))
+            bear_near = (last["spread_pct"] > 0) and (last["spread_pct"] <  eps) and (roc < 0) and adx_ok and (last["rsi"] <= ncfg.get("rsi_ceiling_bear", 52))
+            if confirm_tf:
+                bull_near = bull_near and slope_up
+                bear_near = bear_near and slope_down
+            if bull_near: push_signal(early_signals, sym, last, "bullish", rvol_last, "near")
+            if bear_near: push_signal(early_signals, sym, last, "bearish", rvol_last, "near")
+
+        # MACD histogram flip (cross 0)
+        mcfg = cfg.get("macd_early", {"enabled": False})
+        if mcfg.get("enabled", False) and last["c"] > cfg["price_min"] and rvol_last >= cfg["rvol_min"] and vol_ok_last:
+            lb = int(mcfg.get("lookback", 3))
+            hist = g["macd_hist"]
+            if len(hist) >= 2:
+                macd_up = (hist.iloc[-2] <= 0) and (hist.iloc[-1] > 0)
+                macd_dn = (hist.iloc[-2] >= 0) and (hist.iloc[-1] < 0)
+                adx_ok = (g["adx"].tail(lb).diff().mean() > 0) if mcfg.get("adx_rising", True) else True
+                if confirm_tf:
+                    macd_up = macd_up and slope_up
+                    macd_dn = macd_dn and slope_down
+                if adx_ok and macd_up and last["rsi"] >= mcfg.get("rsi_floor_bull", 48):
+                    push_signal(early_signals, sym, last, "bullish", rvol_last, "macd")
+                if adx_ok and macd_dn and last["rsi"] <= mcfg.get("rsi_ceiling_bear", 52):
+                    push_signal(early_signals, sym, last, "bearish", rvol_last, "macd")
+
+        # RSI regime shift (exit 40–60)
+        rcfg = cfg.get("rsi_regime", {"enabled": False})
+        if rcfg.get("enabled", False) and last["c"] > cfg["price_min"] and rvol_last >= cfg["rvol_min"] and vol_ok_last:
+            lb = int(rcfg.get("lookback", 3))
+            rsi_prev = g["rsi"].iloc[-2] if len(g) >= 2 else last["rsi"]
+            adx_ok = (g["adx"].tail(lb).diff().mean() > 0) if rcfg.get("adx_rising", True) else True
+            bull_reg = (rsi_prev <= rcfg.get("bull_threshold", 60)) and (last["rsi"] > rcfg.get("bull_threshold", 60))
+            bear_reg = (rsi_prev >= rcfg.get("bear_threshold", 40)) and (last["rsi"] < rcfg.get("bear_threshold", 40))
+            if confirm_tf:
+                bull_reg = bull_reg and slope_up
+                bear_reg = bear_reg and slope_down
+            if adx_ok and bull_reg: push_signal(early_signals, sym, last, "bullish", rvol_last, "rsi")
+            if adx_ok and bear_reg: push_signal(early_signals, sym, last, "bearish", rvol_last, "rsi")
+
+        # VWAP reclaim
+        vcfg = cfg.get("vwap_reclaim", {"enabled": False})
+        if vcfg.get("enabled", False) and np.isfinite(last.get("sess_vwap", np.nan)):
+            lb = int(vcfg.get("lookback", 3))
+            spike_mult = float(vcfg.get("vol_spike_mult", 1.2))
+            adx_ok = (g["adx"].tail(lb).diff().mean() > 0) if vcfg.get("adx_rising", True) else True
+            above = last["c"] > last["sess_vwap"]
+            below_prev = (g["c"].iloc[-lb:] < g["sess_vwap"].iloc[-lb:]).all() if len(g) >= lb else False
+            below = last["c"] < last["sess_vwap"]
+            above_prev = (g["c"].iloc[-lb:] > g["sess_vwap"].iloc[-lb:]).all() if len(g) >= lb else False
+            vol_spike = last["v"] >= spike_mult * last["vol_ma20"]
+            if above and below_prev and adx_ok and vol_spike and rvol_last >= cfg["rvol_min"] and last["c"] > cfg["price_min"]:
+                if not confirm_tf or slope_up:
+                    push_signal(early_signals, sym, last, "bullish", rvol_last, "vwap")
+            if below and above_prev and adx_ok and vol_spike and rvol_last >= cfg["rvol_min"] and last["c"] > cfg["price_min"]:
+                if not confirm_tf or slope_down:
+                    push_signal(early_signals, sym, last, "bearish", rvol_last, "vwap")
+
+        # Squeeze breakout (BB width expansion from contraction)
+        scfg = cfg.get("squeeze_breakout", {"enabled": False})
+        if scfg.get("enabled", False) and last["c"] > cfg["price_min"] and rvol_last >= cfg["rvol_min"] and vol_ok_last:
+            min_w = float(scfg.get("min_width", 0.02))
+            lb = int(scfg.get("lookback", 5))
+            if len(g) >= lb+1:
+                was_tight = (g["bb_width"].iloc[-(lb+1):-1] < min_w).all()
+                expanding = g["bb_width"].iloc[-1] > g["bb_width"].iloc[-2]
+                adx_ok = (g["adx"].tail(lb).diff().mean() > 0) if scfg.get("adx_rising", True) else True
+                if was_tight and expanding and adx_ok:
+                    # direction by price vs midline
+                    if last["c"] > last["bb_mid"] and (not confirm_tf or slope_up):
+                        push_signal(early_signals, sym, last, "bullish", rvol_last, "squeeze")
+                    if last["c"] < last["bb_mid"] and (not confirm_tf or slope_down):
+                        push_signal(early_signals, sym, last, "bearish", rvol_last, "squeeze")
+
+        # Optional persistent-state alert (no new cross)
+        if allow_persist and crosses.empty:
+            if last["c"] > cfg["price_min"]:
+                if rvol_last >= cfg["rvol_min"] and float(last.get("adx", np.nan)) >= cfg["adx_min"]:
+                    bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > bull_rsi_min)
+                    bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < bear_rsi_max)
+                    if confirm_tf:
+                        bull_ctx = bull_ctx and slope_up
+                        bear_ctx = bear_ctx and slope_down
+                    if bull_ctx or bear_ctx:
+                        sc = composite_score(last, rvol_last, bull_ctx, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
+                        direction = "bullish" if bull_ctx else "bearish"
+                        today_tag = str(today_et(now_utc))
+                        sig_id = f"{sym}|{direction}|persistent|{today_tag}"
+                        already = (not prev_signals_df.empty and "id" in prev_signals_df.columns and (prev_signals_df["id"] == sig_id).any())
+                        if (not already) and sc >= cfg.get("min_score", 1.8):
+                            ts_iso_ct = last["t"].tz_convert(CENTRAL_TZ).isoformat()
+                            session = "regular" if is_rth(
+                                last["t"], cfg["regular_hours"]["start"], cfg["regular_hours"]["end"], cfg["regular_hours"]["tz"]
+                            ) else "extended"
+                            out_signals.append({
+                                "ticker": sym, "last_price": round(float(last["c"]), 4),
+                                "timestamp": ts_iso_ct, "direction": direction, "session": session,
+                                "id": sig_id, "score": round(float(sc), 3), "rvol": round(rvol_last, 2),
+                                "adx": round(float(last.get("adx", np.nan)), 2), "kind": "persistent"
+                            })
+
+        # Ranking snapshot
+        if last["c"] <= cfg["price_min"]: continue
+        if rvol_last < cfg["rvol_min"]: continue
+        bull_ctx = (last["ema_fast"] > last["ema_slow"]) and (last["rsi"] > bull_rsi_min)
+        bear_ctx = (last["ema_fast"] < last["ema_slow"]) and (last["rsi"] < bear_rsi_max)
+        if confirm_tf:
+            bull_ctx = bull_ctx and slope_up
+            bear_ctx = bear_ctx and slope_down
+        if bull_ctx:
+            sc = composite_score(last, rvol_last, True, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
+            if sc >= cfg.get("ranking_min_score", 1.6):
+                rankings_bull.append((sym, float(last["c"]), float(sc), float(rvol_last), float(last.get("adx", np.nan))))
+        if bear_ctx:
+            sc = composite_score(last, rvol_last, False, cfg, last.get("ema50"), last.get("ema200"), last.get("sess_vwap"))
+            if sc >= cfg.get("ranking_min_score", 1.6):
+                rankings_bear.append((sym, float(last["c"]), float(sc), float(rvol_last), float(last.get("adx", np.nan))))
+
+    # limits
+    max_alerts = cfg.get("max_alerts_per_run", 25)
+    out_signals = sorted(out_signals, key=lambda s: -s["score"])[:max_alerts]
+
+    early_cap = cfg.get("early_alerts_max", 25)
+    early_signals = sorted(early_signals, key=lambda s: -s["score"])[:early_cap]
+
+    rankings_bull.sort(key=lambda x: (-x[2], -x[3]))
+    rankings_bear.sort(key=lambda x: (-x[2], -x[3]))
+
+    log(f"[signals] classic={len(out_signals)} early={len(early_signals)} rankings: bull={len(rankings_bull)} bear={len(rankings_bear)}")
+
+    meta = {
+        "run_time_utc": now_utc.isoformat(),
+        "universe_size": METRICS["universe_size"],
+        "signals_count": len(out_signals) + len(early_signals),
+        "sample_symbols": universe[:10]
+    }
+
+    # Health + stats reporting
+    ok, warn_msg = health_check(cfg, METRICS["universe_size"], METRICS["symbols_with_bars"])
+    if not ok: send_health_webhook(cfg, warn_msg)
+    if cfg.get("stats_report",{}).get("enabled", True):
+        text = summarize_stats_text(cfg.get("stats_report",{}).get("level","compact"),
+                                    METRICS["universe_size"], len(out_signals)+len(early_signals))
+        send_health_webhook(cfg, text)
+    if (len(out_signals)+len(early_signals)) == 0 and cfg.get("health",{}).get("warn_on_empty_signals", True):
+        send_health_webhook(cfg, "ℹ️ No qualifying signals this scan (filters may be tight or just a quiet window).")
+
+    # Output / side effects
+    if dry_run:
+        print({ **meta, "top_bull": rankings_bull[:10], "top_bear": rankings_bear[:10] })
+        METRICS["run_finished_utc"] = utc_now().isoformat()
+        return
+
+    # Persist + webhooks
+    def fmt_line(s):
+        tag = {"cross":"CROSS","persistent":"PERSIST","near":"NEAR","macd":"MACD","rsi":"RSI","vwap":"VWAP","squeeze":"SQUEEZE"}.get(s.get("kind",""),"")
+        return f"**{s['ticker']}** {tag} {s['direction'].upper()} @ ${s['last_price']} — {s['timestamp']} ({s['session']}) | score {s['score']} | RVOL {s['rvol']} | ADX {s['adx']}"
+
+    # write CSV (classic + early in same file)
+    all_to_write = out_signals + early_signals
+    if all_to_write:
+        os.makedirs(os.path.dirname(cfg.get("signals_csv","data/signals.csv")), exist_ok=True)
+        df = pd.DataFrame(all_to_write)
+        csv_path = cfg.get("signals_csv","data/signals.csv")
+        with FileLock(csv_path):
+            if os.path.exists(csv_path):
+                df.to_csv(csv_path, mode="a", header=False, index=False)
+            else:
+                df.to_csv(csv_path, index=False)
+
+    # Classic signals block
+    if out_signals:
+        text = "📈 US 20/50 EMA crosses & setups (since last run)\n" + "\n".join(fmt_line(s) for s in out_signals)
+        send_webhook(cfg, payload_text=text)
+    # Early signals block
+    if early_signals:
+        text2 = "🟡 EARLY SIGNALS (predictive-ish heads-up)\n" + "\n".join(fmt_line(s) for s in early_signals)
+        send_webhook(cfg, payload_text=text2)
+
+    # Ranking snapshot (optional)
+    rank_cfg = cfg.get("ranking_alert", {"enabled": False})
+    if rank_cfg and rank_cfg.get("enabled", False):
+        tb = rankings_bull[: rank_cfg.get("top_n", 10)]
+        trb = "\n".join([f"{i+1}. **{t}** ${p:.2f} | score {s:.2f} | RVOL {rv:.2f} | ADX {ax:.1f}"
+                         for i,(t,p,s,rv,ax) in enumerate(tb)])
+        te = rankings_bear[: rank_cfg.get("top_n", 10)]
+        tre = "\n".join([f"{i+1}. **{t}** ${p:.2f} | score {s:.2f} | RVOL {rv:.2f} | ADX {ax:.1f}"
+                         for i,(t,p,s,rv,ax) in enumerate(te)])
+        msg = "🏁 **Top Trending (composite score)**\n**BULLISH**\n" + (trb or "_none_") + "\n\n**BEARISH**\n" + (tre or "_none_")
+        send_webhook(cfg, payload_text=msg)
+
+    os.makedirs("data", exist_ok=True)
+    save_json("data/last_run.json", meta)
+    METRICS["run_finished_utc"] = utc_now().isoformat()
+    print(meta)
+
+# ---------- CLI ----------
+def main():
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        print("Missing ALPACA_KEY_ID / ALPACA_SECRET_KEY")
+        sys.exit(1)
+
+    cfg = load_cfg()
+    # sensible defaults
+    cfg.setdefault("universe_exchanges", ["NYSE","NASDAQ","AMEX"])
+    cfg.setdefault("bull_rsi_min", 52)
+    cfg.setdefault("bear_rsi_max", 48)
+    cfg.setdefault("volume_mult", 0.8)
+    cfg.setdefault("rvol_use_same_weekday", True)
+    cfg.setdefault("allow_persistent", True)
+    cfg.setdefault("min_score", 1.8)
+    cfg.setdefault("ranking_min_score", 1.6)
+
+    parser = argparse.ArgumentParser(description="US trend monitor (20/50 EMA + early signals)")
+    parser.add_argument("--tickers", type=str, default="", help="Comma-separated tickers to override universe (smoke test)")
+    parser.add_argument("--dry-run", action="store_true", help="Run everything but do not send webhook or write CSV")
+    args = parser.parse_args()
+
+    override = [t for t in args.tickers.split(",")] if args.tickers else None
+    run_monitor(cfg, override_tickers=override, dry_run=args.dry_run)
+
+if __name__ == "__main__":
+    main()
