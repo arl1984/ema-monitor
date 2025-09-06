@@ -441,9 +441,12 @@ def send_webhook(cfg, payload_text: Optional[str]=None, payload_obj: Optional[di
 # ---------- Health / stats ----------
 def send_health_webhook(cfg, text: str, extra: Optional[dict]=None):
     payload = {"content": text} if cfg.get("webhook_type","discord") == "discord" else {"text": text}
-    if extra: payload.update(extra)
-    try: send_webhook(cfg, payload_text=text)
-    except Exception as e: log(f"[health webhook] failed: {e}")
+    if extra:
+        payload.update(extra)
+    try:
+        send_webhook(cfg, payload_obj=payload)
+    except Exception as e:
+        log(f"[health webhook] failed: {e}")
 
 def summarize_stats_text(level: str, universe_size: int, signals_count: int) -> str:
     dur = None
