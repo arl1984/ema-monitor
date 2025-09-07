@@ -1,5 +1,9 @@
+import os
+import sys
 import unittest
 from unittest.mock import patch
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import monitor
 
 class TestHealthWebhook(unittest.TestCase):
