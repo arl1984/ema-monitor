@@ -30,6 +30,15 @@ HEADERS = {
 CENTRAL_TZ = tz.gettz("America/Chicago")
 EASTERN_TZ = tz.gettz("America/New_York")
 
+# ---------- Market hours ----------
+def is_market_hours(now: Optional[datetime] = None) -> bool:
+    now = now.astimezone(EASTERN_TZ) if now else datetime.now(EASTERN_TZ)
+    if now.weekday() >= 5:
+        return False
+    open_t = datetime(now.year, now.month, now.day, 9, 30, tzinfo=EASTERN_TZ)
+    close_t = datetime(now.year, now.month, now.day, 16, 0, tzinfo=EASTERN_TZ)
+    return open_t <= now <= close_t
+
 # ---------- Telemetry (populated per run) ----------
 METRICS = {
     "http_gets": 0,
@@ -423,7 +432,8 @@ def make_signal_id(ticker:str, direction:str, iso_ts:str) -> str:
 # ---------- Webhook ----------
 def send_webhook(cfg, payload_text: Optional[str]=None, payload_obj: Optional[dict]=None):
     url = cfg.get("webhook_url","")
-    if not url: return
+    if not url or not is_market_hours():
+        return
     typ = cfg.get("webhook_type","generic").lower()
     try:
         if typ == "slack":

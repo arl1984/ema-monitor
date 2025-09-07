@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from dateutil import tz
 import yaml
 import requests
+from typing import Optional
 
 def load_cfg():
     with open("config.yaml","r") as f:
@@ -20,6 +21,16 @@ def load_signals():
 
 def ct_now():
     return datetime.utcnow().replace(tzinfo=tz.tzutc()).astimezone(tz.gettz("America/Chicago"))
+
+EASTERN_TZ = tz.gettz("America/New_York")
+
+def is_market_hours(now: Optional[datetime] = None) -> bool:
+    now = now.astimezone(EASTERN_TZ) if now else datetime.now(EASTERN_TZ)
+    if now.weekday() >= 5:
+        return False
+    open_t = datetime(now.year, now.month, now.day, 9, 30, tzinfo=EASTERN_TZ)
+    close_t = datetime(now.year, now.month, now.day, 16, 0, tzinfo=EASTERN_TZ)
+    return open_t <= now <= close_t
 
 def plot_save(fig, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -74,6 +85,8 @@ def send_webhook(cfg, text: str):
     url = cfg.get("webhook_url","");
     if not url:
         print("No webhook configured; saved artifacts only.");
+        return
+    if not is_market_hours():
         return
     typ = cfg.get("webhook_type","generic").lower()
     payload = ({"text": text} if typ=="slack" else {"content": text} if typ=="discord" else {"summary": text})
