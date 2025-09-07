@@ -1,6 +1,6 @@
-# NYSE EMA Monitor
+# ema-montior
 
-NYSE EMA Monitor is a Python project that scans U.S. equities for 20/50 exponential moving average (EMA) crosses and related trend signals. It retrieves market data from the [Alpaca Markets](https://alpaca.markets/) API, ranks potential setups, and can send alerts via webhooks.
+ema-montior is a Python project that scans U.S. equities for 20/50 exponential moving average (EMA) crosses and related trend signals. It retrieves market data from the [Alpaca Markets](https://alpaca.markets/) API, ranks potential setups, and can send alerts via webhooks.
 
 ## Features
 
