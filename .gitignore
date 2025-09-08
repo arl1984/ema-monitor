@@ -1,0 +1,36 @@
+# Ignore data directories and artifacts
+# These may contain large datasets or generated outputs
+/data/
+/artifacts/
+
+# Environment files containing secrets
+.env
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Log and database files
+*.log
+*.sqlite
+*.db
+
+# Large dataset files
+*.csv
+*.tsv
+*.json
+*.h5
+*.npz
+*.npy
+*.parquet
+
+# Keys and certificates
+*.key
+*.pem
+*.crt
+
+# Virtual environment directories
+.venv/
+venv/
+
