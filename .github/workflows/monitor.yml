@@ -1,14 +1,8 @@
 name: NYSE 20/50 EMA Monitor
 
 on:
+  # Disable scheduled runs; workflow can still be triggered manually.
   workflow_dispatch: {}
-  schedule:
-    # Every 15 minutes, 24/7 (UTC)
-    - cron: "*/15 * * * *"
-    # Daily summary at ~23:59 CT (≈ 04:59 UTC)
-    - cron: "59 4 * * *"
-    # Weekly roll-up Sunday 23:59 CT (≈ Monday 04:59 UTC)
-    - cron: "59 4 * * MON"
 
 permissions:
   contents: write
